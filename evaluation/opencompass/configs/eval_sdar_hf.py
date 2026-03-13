@@ -1,85 +1,78 @@
 import torch
-from mmengine.config import read_base
+from opencompass.datasets import (
+    GSM8KDataset,
+    IFEvalDataset,
+    IFEvaluator,
+    MATHEvaluator,
+    gsm8k_dataset_postprocess,
+    math_postprocess_v2,
+)
+from opencompass.openicl.icl_inferencer import GenInferencer
+from opencompass.openicl.icl_prompt_template import PromptTemplate
+from opencompass.openicl.icl_retriever import ZeroRetriever
 from opencompass.runners import LocalRunner
 from opencompass.partitioners import NaivePartitioner, NumWorkerPartitioner
 from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
 from opencompass.models import BD3withChatTemplate
 
 
-with read_base():
-    # datasets setting
-    from opencompass.configs.datasets.mmlu.mmlu_gen_4d595a import mmlu_datasets
-    # math
-    from opencompass.configs.datasets.gsm8k.gsm8k_0shot_v2_gen_17d799 import gsm8k_datasets
-    from opencompass.configs.datasets.math.math_prm800k_500_0shot_cot_gen_11c4b5 import math_datasets
-    from opencompass.configs.datasets.humaneval.humaneval_gen import humaneval_datasets
-    from opencompass.configs.datasets.mbpp.sanitized_mbpp_mdblock_0shot_nocot_gen_a2e416 import sanitized_mbpp_datasets
-
-    from opencompass.configs.datasets.MathBench.mathbench_2024_gen_50a320 import (
-        mathbench_datasets,
+gsm8k_datasets = [
+    dict(
+        abbr='gsm8k',
+        type=GSM8KDataset,
+        path='opencompass/gsm8k',
+        reader_cfg=dict(input_columns=['question'], output_column='answer'),
+        infer_cfg=dict(
+            prompt_template=dict(
+                type=PromptTemplate,
+                template=dict(
+                    round=[
+                        dict(
+                            role='HUMAN',
+                            prompt=(
+                                '{question}\nPlease reason step by step, and '
+                                'put your final answer within \\boxed{}.'
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            retriever=dict(type=ZeroRetriever),
+            inferencer=dict(type=GenInferencer),
+        ),
+        eval_cfg=dict(
+            evaluator=dict(type=MATHEvaluator, version='v2'),
+            pred_postprocessor=dict(type=math_postprocess_v2),
+            dataset_postprocessor=dict(type=gsm8k_dataset_postprocess),
+        ),
     )
-    # Instruction Following
-    from opencompass.configs.datasets.IFEval.IFEval_gen_353ae7 import (
-        ifeval_datasets,
-    )
-    # summarizer
-    from opencompass.configs.summarizers.internlm2_keyset import summarizer
-    from opencompass.configs.summarizers.groups.mathbench_v1_2024 import (
-        mathbench_2024_summary_groups,
-    )
-    from opencompass.configs.summarizers.groups.mmlu import mmlu_summary_groups
+]
 
-# summarizer
-summary_groups = sum(
-    [v for k, v in locals().items() if k.endswith('_summary_groups')], []
-)
-
-summary_groups.append(
-    {
-        'name': 'Mathbench',
-        'subsets': ['mathbench-a (average)', 'mathbench-t (average)'],
-    },
-)
+ifeval_datasets = [
+    dict(
+        abbr='IFEval',
+        type=IFEvalDataset,
+        path='data/ifeval/input_data.jsonl',
+        reader_cfg=dict(input_columns=['prompt'], output_column='reference'),
+        infer_cfg=dict(
+            prompt_template=dict(
+                type=PromptTemplate,
+                template=dict(round=[dict(role='HUMAN', prompt='{prompt}')]),
+            ),
+            retriever=dict(type=ZeroRetriever),
+            inferencer=dict(type=GenInferencer),
+        ),
+        eval_cfg=dict(
+            evaluator=dict(type=IFEvaluator),
+            pred_role='BOT',
+        ),
+    )
+]
 
 # Summarizer
 summarizer = dict(
-    dataset_abbrs=[
-        'Instruction Following',
-        ['IFEval', 'Prompt-level-strict-accuracy'],
-        '',
-        "Math Calculation",
-        ["gsm8k", "accuracy"],
-        ['Mathbench', 'naive_average'],
-        ['math_prm800k_500', 'accuracy'],
-        '',
-        'Knowledge',
-        ['mmlu', 'naive_average'],
-        '',
-        'Code',
-        ['openai_humaneval', 'humaneval_pass@1'],
-        ['sanitized_mbpp', 'score'],
-        '',
-        'mmlu',
-        'mmlu-stem',
-        'mmlu-social-science',
-        'mmlu-humanities',
-        'mmlu-other',
-        '',
-        '###### MathBench-A: Application Part ######',
-        'college',
-        'high',
-        'middle',
-        'primary',
-        'arithmetic',
-        'mathbench-a (average)',
-        '###### MathBench-T: Theory Part ######',
-        'college_knowledge',
-        'high_knowledge',
-        'middle_knowledge',
-        'primary_knowledge',
-        'mathbench-t (average)',
-    ],
-    summary_groups=summary_groups,
+    dataset_abbrs=[['gsm8k', 'accuracy']],
+    summary_groups=[],
 )
 
 # datasets = [*mmlu_datasets, *gsm8k_datasets, *humaneval_datasets, *sanitized_mbpp_datasets, *math_datasets, *mathbench_datasets, *ifeval_datasets]

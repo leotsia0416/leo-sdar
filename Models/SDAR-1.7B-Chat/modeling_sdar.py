@@ -45,16 +45,6 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
-# Pre-register submodules to handle hyphenated directory names
-import importlib.util as _ilu, os as _os, sys as _sys
-_dir = _os.path.dirname(_os.path.abspath(__file__))
-for _n in ["configuration_sdar", "fused_linear_diffusion_cross_entropy"]:
-    _fqn = f"{__name__.rsplit(chr(46), 1)[0]}.{_n}" if chr(46) in (__name__ or "") else _n
-    if _fqn not in _sys.modules:
-        _sp = _ilu.spec_from_file_location(_fqn, _os.path.join(_dir, f"{_n}.py"))
-        _md = _ilu.module_from_spec(_sp)
-        _sys.modules[_fqn] = _md
-        _sp.loader.exec_module(_md)
 from .configuration_sdar import SDARConfig
 from .fused_linear_diffusion_cross_entropy import FusedLinearDiffusionCrossEntropyLoss
 
@@ -81,7 +71,7 @@ if is_torch_flex_attn_available():
 
 logger = logging.get_logger(__name__)
 
-# @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")  # Commented out to prevent Dynamo compile errors with Tensor masks
+@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(query, key, value, attention_mask, **kwargs):
     return flex_attention(query, key, value, block_mask=attention_mask, **kwargs)
 
@@ -288,29 +278,15 @@ class SDARAttention(nn.Module):
             value_states = torch.cat(
                 [past_value_states, value_states], dim=-2)
 
-        if isinstance(attention_mask, torch.Tensor) or attention_mask is None:
-            # Match grouped-query attention head counts before entering SDPA.
-            key_states_for_attn = repeat_kv(key_states, self.num_key_value_groups)
-            value_states_for_attn = repeat_kv(value_states, self.num_key_value_groups)
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states_for_attn,
-                value_states_for_attn,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=(attention_mask is None),
-            )
-            attn_weights = None
-        else:
-            attn_output, attn_weights = fused_flex_attention(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-                attention_mask=attention_mask,
-                enable_gqa=True,
-                scale=self.scaling,
-                return_lse=True
-            )
+        attn_output, attn_weights = fused_flex_attention(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            attention_mask=attention_mask,
+            enable_gqa=True,
+            scale=self.scaling,
+            return_lse=True
+        )
         attn_weights = attn_weights.to(
             value_states.dtype) if attn_weights is not None else None
         attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
@@ -531,9 +507,9 @@ class SDARModel(SDARPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        attention_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+        # causal_mask = self._update_causal_mask(
+        #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        # )
 
         hidden_states = inputs_embeds
 

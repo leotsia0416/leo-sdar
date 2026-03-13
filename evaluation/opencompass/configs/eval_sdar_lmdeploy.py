@@ -1,5 +1,16 @@
 from mmengine.config import read_base
+from opencompass.datasets import (
+    GSM8KDataset,
+    IFEvalDataset,
+    IFEvaluator,
+    MATHEvaluator,
+    gsm8k_dataset_postprocess,
+    math_postprocess_v2,
+)
 from opencompass.models import LMDeploywithChatTemplate
+from opencompass.openicl.icl_inferencer import GenInferencer
+from opencompass.openicl.icl_prompt_template import PromptTemplate
+from opencompass.openicl.icl_retriever import ZeroRetriever
 from opencompass.partitioners import NaivePartitioner, NumWorkerPartitioner
 from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLEvalTask, OpenICLInferTask
@@ -49,30 +60,87 @@ if not (0 < CONFIDENCE_THRESHOLD <= 1.0):
 if EVAL_SCOPE not in {'gsm8k', 'full'}:
     raise ValueError("SDAR_EVAL_SCOPE must be either 'gsm8k' or 'full'.")
 
-with read_base():
-    from opencompass.configs.datasets.IFEval.IFEval_gen_353ae7 import (
-        ifeval_datasets,
+if EVAL_SCOPE == 'full':
+    with read_base():
+        from opencompass.configs.datasets.MathBench.mathbench_2024_gen_50a320 import (
+            mathbench_datasets,
+        )
+        from opencompass.configs.datasets.gsm8k.gsm8k_0shot_v2_gen_17d799 import (
+            gsm8k_datasets,
+        )
+        from opencompass.configs.datasets.humaneval.humaneval_gen import (
+            humaneval_datasets,
+        )
+        from opencompass.configs.datasets.math.math_prm800k_500_0shot_cot_gen_11c4b5 import (
+            math_datasets,
+        )
+        from opencompass.configs.datasets.mbpp.sanitized_mbpp_mdblock_0shot_nocot_gen_a2e416 import (
+            sanitized_mbpp_datasets,
+        )
+        from opencompass.configs.datasets.mmlu.mmlu_gen_4d595a import (
+            mmlu_datasets,
+        )
+        from opencompass.configs.summarizers.groups.mathbench_v1_2024 import (
+            mathbench_2024_summary_groups,
+        )
+        from opencompass.configs.summarizers.groups.mmlu import (
+            mmlu_summary_groups,
+        )
+else:
+    gsm8k_datasets = [
+        dict(
+            abbr='gsm8k',
+            type=GSM8KDataset,
+            path='opencompass/gsm8k',
+            reader_cfg=dict(input_columns=['question'], output_column='answer'),
+            infer_cfg=dict(
+                prompt_template=dict(
+                    type=PromptTemplate,
+                    template=dict(
+                        round=[
+                            dict(
+                                role='HUMAN',
+                                prompt=(
+                                    '{question}\nPlease reason step by step, '
+                                    'and put your final answer within '
+                                    '\\boxed{}.'
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+                retriever=dict(type=ZeroRetriever),
+                inferencer=dict(type=GenInferencer),
+            ),
+            eval_cfg=dict(
+                evaluator=dict(type=MATHEvaluator, version='v2'),
+                pred_postprocessor=dict(type=math_postprocess_v2),
+                dataset_postprocessor=dict(type=gsm8k_dataset_postprocess),
+            ),
+        )
+    ]
+
+
+ifeval_datasets = [
+    dict(
+        abbr='IFEval',
+        type=IFEvalDataset,
+        path='data/ifeval/input_data.jsonl',
+        reader_cfg=dict(input_columns=['prompt'], output_column='reference'),
+        infer_cfg=dict(
+            prompt_template=dict(
+                type=PromptTemplate,
+                template=dict(round=[dict(role='HUMAN', prompt='{prompt}')]),
+            ),
+            retriever=dict(type=ZeroRetriever),
+            inferencer=dict(type=GenInferencer),
+        ),
+        eval_cfg=dict(
+            evaluator=dict(type=IFEvaluator),
+            pred_role='BOT',
+        ),
     )
-    from opencompass.configs.datasets.MathBench.mathbench_2024_gen_50a320 import (
-        mathbench_datasets,
-    )
-    from opencompass.configs.datasets.gsm8k.gsm8k_0shot_v2_gen_17d799 import (
-        gsm8k_datasets,
-    )
-    from opencompass.configs.datasets.humaneval.humaneval_gen import (
-        humaneval_datasets,
-    )
-    from opencompass.configs.datasets.math.math_prm800k_500_0shot_cot_gen_11c4b5 import (
-        math_datasets,
-    )
-    from opencompass.configs.datasets.mbpp.sanitized_mbpp_mdblock_0shot_nocot_gen_a2e416 import (
-        sanitized_mbpp_datasets,
-    )
-    from opencompass.configs.datasets.mmlu.mmlu_gen_4d595a import mmlu_datasets
-    from opencompass.configs.summarizers.groups.mathbench_v1_2024 import (
-        mathbench_2024_summary_groups,
-    )
-    from opencompass.configs.summarizers.groups.mmlu import mmlu_summary_groups
+]
 
 
 full_summary_groups = sum(

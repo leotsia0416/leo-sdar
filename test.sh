@@ -9,15 +9,16 @@
 #SBATCH -o SDAR_eval.out
 #SBATCH -e SDAR_eval.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=tom.ee13@nycu.edu.tw
+#SBATCH --mail-user=leotsia.ee13@nycu.edu.tw
 
 set -euo pipefail
 
-export PATH="/work/tom900908/sdar_eval/bin:${PATH}"
+export PATH="/work/leotsia0416/sdar_eval/bin:${PATH}"
 export PYTHONNOUSERSITE=1
-cd /work/tom900908/SDAR/evaluation/opencompass
+cd /work/leotsia0416/projects/SDAR/evaluation/opencompass
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-export SDAR_MODEL_ROOT="/work/tom900908/SDAR/Models"
+export SDAR_MODEL_ROOT="/work/leotsia0416/projects/SDAR/Models"
 export SDAR_MODEL_NAME="SDAR-1.7B-Chat"
 export SDAR_EVAL_SCOPE="gsm8k"
 export SDAR_EVAL_GPUS="2"
@@ -37,4 +38,4 @@ export NCCL_BLOCKING_WAIT=1
 export NCCL_TIMEOUT=1200
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 
-/work/tom900908/sdar_eval/bin/python run.py configs/eval_sdar_lmdeploy.py
+/work/leotsia0416/sdar_eval/bin/python run.py configs/eval_sdar_lmdeploy.py
