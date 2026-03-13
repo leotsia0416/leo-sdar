@@ -1,0 +1,26 @@
+model_dir: Models/SDAR_1_7B_Chat
+trust_remote_code: true
+device: cuda
+dtype: float16
+prompt_length: 1024
+block_length: 4
+gen_length: 1024
+denoising_steps: 4
+temperature: 1.0
+top_k: 50
+top_p: 0.95
+remasking_strategy: low_confidence_dynamic
+confidence_threshold: 0.95
+eb_threshold: 0.35
+stopping_criteria_idx: null
+num_counterfactual_blocks: 1
+remask_penalty_lambda: 0.0
+policy_mode: learned
+policy_ckpt: outputs/remask_policy/train/policy.pt
+policy_threshold: 0.5
+heuristic_confidence_threshold: 0.95
+output_dir: outputs/remask_policy/infer
+random_seed: 0
+prompt: "Explain why the sum of two odd numbers is even."
+prompt_file: null
+save_filename: remask_infer.json

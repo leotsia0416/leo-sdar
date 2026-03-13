@@ -1,17 +1,17 @@
-03/11 23:16:39 - OpenCompass - INFO - Current exp folder: ./outputs/eval-chat-sdar/20260311_231639
-03/11 23:16:39 - OpenCompass - WARNING - SlurmRunner is not used, so the partition argument is ignored.
-03/11 23:16:39 - OpenCompass - INFO - Partitioned into 2 tasks.
-03/11 23:16:39 - OpenCompass - WARNING - Ignored argument in opencompass.runners.local: retry=5
+03/12 15:37:39 - OpenCompass - INFO - Current exp folder: ./outputs/eval-chat-sdar/20260312_153739
+03/12 15:37:39 - OpenCompass - WARNING - SlurmRunner is not used, so the partition argument is ignored.
+03/12 15:37:39 - OpenCompass - INFO - Partitioned into 2 tasks.
+03/12 15:37:39 - OpenCompass - WARNING - Ignored argument in opencompass.runners.local: retry=5
 launch OpenICLInfer[SDAR-1.7B-Chat-b4-thr0_95/gsm8k_0] on GPU 0
 launch OpenICLInfer[SDAR-1.7B-Chat-b4-thr0_95/gsm8k_1] on GPU 1
-03/11 23:23:31 - OpenCompass - WARNING - Default to dump eval details, it might take extraspace to save all the evaluation details. Set --dump-eval-details False to skip the details dump
-03/11 23:23:31 - OpenCompass - INFO - Partitioned into 1 tasks.
+03/12 15:44:56 - OpenCompass - WARNING - Default to dump eval details, it might take extraspace to save all the evaluation details. Set --dump-eval-details False to skip the details dump
+03/12 15:44:56 - OpenCompass - INFO - Partitioned into 1 tasks.
 launch OpenICLEval[SDAR-1.7B-Chat-b4-thr0_95/gsm8k] on CPU 
 dataset    version    metric    mode      SDAR-1.7B-Chat-b4-thr0_95
 ---------  ---------  --------  ------  ---------------------------
 gsm8k      85a392     accuracy  gen                           80.06
-03/11 23:23:39 - OpenCompass - INFO - write summary to /work/tom900908/SDAR/evaluation/opencompass/outputs/eval-chat-sdar/20260311_231639/summary/summary_20260311_231639.txt
-03/11 23:23:39 - OpenCompass - INFO - write csv to /work/tom900908/SDAR/evaluation/opencompass/outputs/eval-chat-sdar/20260311_231639/summary/summary_20260311_231639.csv
+03/12 15:45:05 - OpenCompass - INFO - write summary to /work/leotsia0416/projects/SDAR/evaluation/opencompass/outputs/eval-chat-sdar/20260312_153739/summary/summary_20260312_153739.txt
+03/12 15:45:05 - OpenCompass - INFO - write csv to /work/leotsia0416/projects/SDAR/evaluation/opencompass/outputs/eval-chat-sdar/20260312_153739/summary/summary_20260312_153739.csv
 
 
 The markdown format results is as below:
@@ -20,4 +20,4 @@ The markdown format results is as below:
 |----- | ----- | ----- | ----- | -----|
 | gsm8k | 85a392 | accuracy | gen | 80.06 |
 
-03/11 23:23:39 - OpenCompass - INFO - write markdown summary to /work/tom900908/SDAR/evaluation/opencompass/outputs/eval-chat-sdar/20260311_231639/summary/summary_20260311_231639.md
+03/12 15:45:05 - OpenCompass - INFO - write markdown summary to /work/leotsia0416/projects/SDAR/evaluation/opencompass/outputs/eval-chat-sdar/20260312_153739/summary/summary_20260312_153739.md
