@@ -185,3 +185,4 @@ run/
 assets/
 *.jsonl
 *.json
+vendor/
