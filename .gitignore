@@ -183,3 +183,5 @@ Models/
 checkpoint/
 run/
 assets/
+*.jsonl
+*.json
