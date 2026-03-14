@@ -21,7 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Tuple, Union, List
+from typing import Callable, Optional, Tuple, Union, List, TypedDict
 
 import torch
 from torch import nn
@@ -44,11 +44,17 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+try:
+    from transformers.utils import LossKwargs
+except ImportError:
+    class LossKwargs(TypedDict, total=False):
+        pass
+
+from transformers.utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
 # Pre-register submodules to handle hyphenated directory names
 import importlib.util as _ilu, os as _os, sys as _sys
 _dir = _os.path.dirname(_os.path.abspath(__file__))
-for _n in ["configuration_sdar", "fused_linear_diffusion_cross_entropy"]:
+for _n in ["configuration_sdar", "fused_linear_diffusion_cross_entropy", "gap_sdar_training"]:
     _fqn = f"{__name__.rsplit(chr(46), 1)[0]}.{_n}" if chr(46) in (__name__ or "") else _n
     if _fqn not in _sys.modules:
         _sp = _ilu.spec_from_file_location(_fqn, _os.path.join(_dir, f"{_n}.py"))
@@ -57,8 +63,17 @@ for _n in ["configuration_sdar", "fused_linear_diffusion_cross_entropy"]:
         _sp.loader.exec_module(_md)
 from .configuration_sdar import SDARConfig
 from .fused_linear_diffusion_cross_entropy import FusedLinearDiffusionCrossEntropyLoss
+from .gap_sdar_training import (
+    apply_gap_remask,
+    build_rollout_p_mask,
+    get_num_transfer_tokens,
+    select_teacher_forced_rollout_tokens,
+)
 
-from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+try:
+    from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+except ImportError:
+    flash_rms_norm = None
 
 import torch.nn.functional as F
 try:
@@ -373,16 +388,17 @@ class SDARRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        return flash_rms_norm(
-            hidden_states, weight=self.weight, bias=None, eps=self.variance_epsilon)
-        '''
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * \
             torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-        '''
+        hidden_states = hidden_states.to(input_dtype)
+        if flash_rms_norm is not None:
+            return flash_rms_norm(
+                hidden_states, weight=self.weight, bias=None, eps=self.variance_epsilon
+            )
+        return self.weight * hidden_states
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -547,10 +563,14 @@ class SDARAttention(nn.Module):
             hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(
             hidden_shape).transpose(1, 2)
+        query_states = query_states.to(value_states.dtype)
+        key_states = key_states.to(value_states.dtype)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin)
+        query_states = query_states.to(value_states.dtype)
+        key_states = key_states.to(value_states.dtype)
 
         if past_key_value is not None and kwargs.get("store_kv", False):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -565,24 +585,24 @@ class SDARAttention(nn.Module):
                 [past_value_states, value_states], dim=-2)
 
         if self.training:
-        if isinstance(attention_mask, torch.Tensor) or attention_mask is None:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0, is_causal=(attention_mask is None)
-            )
-            attn_weights = None
-        else:
-            attn_output, attn_weights = fused_flex_attention(
-                    query=query_states,
-                    key=key_states,
-                    value=value_states,
-                    attention_mask=attention_mask,
-                    enable_gqa=True,
-                    scale=self.scaling,
-                    return_lse=True
+            if isinstance(attention_mask, torch.Tensor) or attention_mask is None:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0, is_causal=(attention_mask is None)
                 )
-            attn_weights = attn_weights.to(
-                value_states.dtype) if attn_weights is not None else None
-            attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
+                attn_weights = None
+            else:
+                attn_output, attn_weights = fused_flex_attention(
+                        query=query_states,
+                        key=key_states,
+                        value=value_states,
+                        attention_mask=attention_mask,
+                        enable_gqa=True,
+                        scale=self.scaling,
+                        return_lse=True
+                    )
+                attn_weights = attn_weights.to(
+                    value_states.dtype) if attn_weights is not None else None
+                attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
         else:
             attention_mask = attention_mask.bool() if attention_mask is not None else None
             attn_weights = None
@@ -881,6 +901,13 @@ class SDARModel(SDARPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool = False,
     ):
+        # Training can pass a precomputed flex-attention BlockMask even when the
+        # Transformers-selected backend is not "flex_attention". In that case the
+        # mask should bypass tensor-only causal-mask preparation entirely.
+        if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
+            assert isinstance(attention_mask, BlockMask)
+            return attention_mask
+
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and past_key_values is not None:
                 is_padding_right = attention_mask[:, -
@@ -1060,6 +1087,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(
             config.hidden_size, config.vocab_size, bias=False)
+        self.gap_remask_head = nn.Linear(config.hidden_size, 1, bias=True)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1082,15 +1110,10 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    def prepare_for_bd_training(self, inputs_ids, position_ids, prompt_mask):
+    def build_bd_training_inputs(self, inputs_ids, noisy_inputs_ids, position_ids, logits_to_keep_half, num_tokens=None):
         bsz, seq_len = inputs_ids.shape
-        num_tokens = calculate_token_nums(position_ids) # List[torch.Tensor]
-        noisy_inputs_ids, logits_to_keep_half, p_mask = forward_add_noise_packed(
-            inputs_ids=inputs_ids,
-            num_tokens_list=num_tokens,
-            prompt_mask=prompt_mask,
-            mask_id=self.config.mask_token_id,
-        )
+        if num_tokens is None:
+            num_tokens = calculate_token_nums(position_ids)
         router_noisy_part_list = []
         for i in range(bsz):
             cur_router_noisy_part = (torch.arange(num_tokens[i].shape[0] *2) % 2 == 0).to(inputs_ids.device)
@@ -1123,7 +1146,139 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                             Q_LEN=attention_mask.size(1), KV_LEN=attention_mask.size(2),
         )
 
-        return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask
+        return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, num_tokens
+
+    def prepare_for_bd_training(self, inputs_ids, position_ids, prompt_mask):
+        num_tokens = calculate_token_nums(position_ids) # List[torch.Tensor]
+        noisy_inputs_ids, logits_to_keep_half, p_mask = forward_add_noise_packed(
+            inputs_ids=inputs_ids,
+            num_tokens_list=num_tokens,
+            prompt_mask=prompt_mask,
+            mask_id=self.config.mask_token_id,
+        )
+        concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, _ = self.build_bd_training_inputs(
+            inputs_ids=inputs_ids,
+            noisy_inputs_ids=noisy_inputs_ids,
+            position_ids=position_ids,
+            logits_to_keep_half=logits_to_keep_half,
+            num_tokens=num_tokens,
+        )
+
+        return {
+            "concat_inputs_ids": concat_inputs_ids,
+            "concat_position_ids": concat_position_ids,
+            "flex_attention_mask_3d": flex_attention_mask_3d,
+            "logits_to_keep_half": logits_to_keep_half,
+            "logits_to_keep": logits_to_keep,
+            "p_mask": p_mask,
+            "noisy_inputs_ids": noisy_inputs_ids,
+            "num_tokens": num_tokens,
+        }
+
+    def prepare_for_teacher_forced_rollout_training(
+        self,
+        inputs_ids,
+        labels,
+        position_ids,
+        prompt_mask,
+        output_attentions,
+        output_hidden_states,
+        cache_position,
+        **kwargs,
+    ):
+        num_tokens = calculate_token_nums(position_ids)
+        answer_mask = ~prompt_mask
+        noisy_inputs_ids = torch.where(
+            answer_mask,
+            torch.full_like(inputs_ids, self.config.mask_token_id),
+            inputs_ids,
+        )
+
+        rollout_steps = int(getattr(self.config, "gap_rollout_steps", self.config.block_size))
+        rollout_steps = max(1, rollout_steps)
+        transfer_schedule = get_num_transfer_tokens(self.config.block_size, rollout_steps).tolist()
+        rollout_depth = int(torch.randint(0, rollout_steps, (1,), device=inputs_ids.device).item())
+        rollout_strategy = getattr(self.config, "gap_rollout_strategy", "low_confidence_dynamic")
+        rollout_confidence_threshold = float(getattr(self.config, "gap_rollout_confidence_threshold", 0.95))
+
+        for step_idx in range(rollout_depth):
+            masked_indices = noisy_inputs_ids.eq(self.config.mask_token_id) & answer_mask
+            if not masked_indices.any():
+                break
+
+            concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, _ = self.build_bd_training_inputs(
+                inputs_ids=inputs_ids,
+                noisy_inputs_ids=noisy_inputs_ids,
+                position_ids=position_ids,
+                logits_to_keep_half=masked_indices,
+                num_tokens=num_tokens,
+            )
+            outputs = self.model(
+                input_ids=concat_inputs_ids,
+                attention_mask=flex_attention_mask_3d,
+                position_ids=concat_position_ids,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            hidden_states = outputs.last_hidden_state[logits_to_keep].contiguous()
+            proposal_logits = self.lm_head(hidden_states).float()
+            proposal_ids = proposal_logits.argmax(dim=-1)
+            proposal_scores = (
+                proposal_logits.gather(-1, proposal_ids.unsqueeze(-1)).squeeze(-1)
+                - torch.logsumexp(proposal_logits, dim=-1)
+            ).exp()
+            proposal_scores_full = torch.full(
+                noisy_inputs_ids.shape,
+                float("-inf"),
+                dtype=proposal_scores.dtype,
+                device=proposal_scores.device,
+            )
+            proposal_scores_full[masked_indices] = proposal_scores
+            reveal_mask = select_teacher_forced_rollout_tokens(
+                masked_indices=masked_indices,
+                proposal_scores_full=proposal_scores_full,
+                num_tokens=num_tokens,
+                block_size=self.config.block_size,
+                num_transfer_tokens=int(transfer_schedule[step_idx]),
+                strategy=rollout_strategy,
+                confidence_threshold=rollout_confidence_threshold,
+            )
+            if not reveal_mask.any():
+                break
+            noisy_inputs_ids[reveal_mask] = inputs_ids[reveal_mask]
+
+        logits_to_keep_half = noisy_inputs_ids.eq(self.config.mask_token_id) & answer_mask
+        if not logits_to_keep_half.any() and answer_mask.any():
+            fallback_index = torch.nonzero(answer_mask, as_tuple=False)[0]
+            noisy_inputs_ids[fallback_index[0], fallback_index[1]] = self.config.mask_token_id
+            logits_to_keep_half[fallback_index[0], fallback_index[1]] = True
+        p_mask = build_rollout_p_mask(
+            masked_indices=logits_to_keep_half,
+            labels=labels,
+            num_tokens=num_tokens,
+        )
+        concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, _ = self.build_bd_training_inputs(
+            inputs_ids=inputs_ids,
+            noisy_inputs_ids=noisy_inputs_ids,
+            position_ids=position_ids,
+            logits_to_keep_half=logits_to_keep_half,
+            num_tokens=num_tokens,
+        )
+
+        return {
+            "concat_inputs_ids": concat_inputs_ids,
+            "concat_position_ids": concat_position_ids,
+            "flex_attention_mask_3d": flex_attention_mask_3d,
+            "logits_to_keep_half": logits_to_keep_half,
+            "logits_to_keep": logits_to_keep,
+            "p_mask": p_mask,
+            "noisy_inputs_ids": noisy_inputs_ids,
+            "num_tokens": num_tokens,
+            "rollout_depth": rollout_depth,
+        }
 
     @can_return_tuple
     @auto_docstring
@@ -1171,12 +1326,28 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         if self.training:
             assert inputs_embeds is None, "only support input_ids during training"
             prompt_mask = (labels == -100) if labels is not None else None
+            if position_ids is None:
+                position_ids = torch.arange(
+                    input_ids.shape[1], device=input_ids.device, dtype=torch.long
+                ).unsqueeze(0).expand(input_ids.shape[0], -1)
             position_ids = modify_padded_position_ids_2d(position_ids)
-            concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask = self.prepare_for_bd_training(input_ids, position_ids, prompt_mask)
+            if getattr(self.config, "gap_enable", False):
+                training_batch = self.prepare_for_teacher_forced_rollout_training(
+                    input_ids,
+                    labels,
+                    position_ids,
+                    prompt_mask,
+                    output_attentions,
+                    output_hidden_states,
+                    cache_position,
+                    **kwargs,
+                )
+            else:
+                training_batch = self.prepare_for_bd_training(input_ids, position_ids, prompt_mask)
             outputs = self.model(
-                input_ids=concat_inputs_ids,
-                attention_mask=flex_attention_mask_3d,
-                position_ids=concat_position_ids,
+                input_ids=training_batch["concat_inputs_ids"],
+                attention_mask=training_batch["flex_attention_mask_3d"],
+                position_ids=training_batch["concat_position_ids"],
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=True,
@@ -1184,19 +1355,70 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
             hidden_states = outputs.last_hidden_state
-            hidden_states = hidden_states[logits_to_keep].contiguous()
             assert labels is not None, "Labels must be provided for training."
             answer_len = (labels != -100).sum()
-            loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
-            loss = loss_fct(  # it will return (sum_loss, unreduced_loss)
-                    # conduct `view(-1, V)` inside the function
-                    x=hidden_states,
-                    target=labels[logits_to_keep_half].contiguous(),
+            hidden_states = hidden_states[training_batch["logits_to_keep"]].contiguous()
+            if getattr(self.config, "gap_enable", False):
+                proposal_logits = self.lm_head(hidden_states).float()
+                proposal_ids = proposal_logits.argmax(dim=-1)
+                proposal_scores = (
+                    proposal_logits.gather(-1, proposal_ids.unsqueeze(-1)).squeeze(-1)
+                    - torch.logsumexp(proposal_logits, dim=-1)
+                ).exp()
+                remask_logits = self.gap_remask_head(hidden_states).squeeze(-1)
+                gap_outputs = apply_gap_remask(
+                    noisy_input_ids=training_batch["noisy_inputs_ids"],
+                    labels=labels,
+                    masked_indices=training_batch["logits_to_keep_half"],
+                    p_mask=training_batch["p_mask"],
+                    proposal_ids=proposal_ids,
+                    proposal_scores=proposal_scores,
+                    remask_logits=remask_logits,
+                    mask_token_id=self.config.mask_token_id,
+                    reveal_ratio=getattr(self.config, "gap_reveal_ratio", 0.25),
+                    min_reveal_tokens=getattr(self.config, "gap_min_reveal_tokens", 1),
+                    remask_threshold=getattr(self.config, "gap_remask_threshold", 0.5),
+                    remask_loss_weight=getattr(self.config, "gap_remask_loss_weight", 1.0),
+                    remask_default_p_mask=getattr(self.config, "gap_remask_default_p_mask", 1.0),
+                )
+                proj_concat_inputs_ids, proj_concat_position_ids, proj_flex_attention_mask_3d, proj_logits_to_keep_half, proj_logits_to_keep, _ = self.build_bd_training_inputs(
+                    inputs_ids=input_ids,
+                    noisy_inputs_ids=gap_outputs.z_proj,
+                    position_ids=position_ids,
+                    logits_to_keep_half=gap_outputs.projected_mask,
+                    num_tokens=training_batch["num_tokens"],
+                )
+                proj_outputs = self.model(
+                    input_ids=proj_concat_inputs_ids,
+                    attention_mask=proj_flex_attention_mask_3d,
+                    position_ids=proj_concat_position_ids,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+                proj_hidden_states = proj_outputs.last_hidden_state[proj_logits_to_keep].contiguous()
+                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
+                loss = loss_fct(
+                    x=proj_hidden_states,
+                    target=labels[proj_logits_to_keep_half].contiguous(),
                     weight=self.lm_head.weight,
                     bias=self.lm_head.bias,
-                    p_mask=p_mask,
+                    p_mask=gap_outputs.projected_p_mask,
                 )
-            loss = loss / answer_len
+                loss = (loss / answer_len) + gap_outputs.remask_loss
+            else:
+                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
+                loss = loss_fct(  # it will return (sum_loss, unreduced_loss)
+                        # conduct `view(-1, V)` inside the function
+                        x=hidden_states,
+                        target=labels[training_batch["logits_to_keep_half"]].contiguous(),
+                        weight=self.lm_head.weight,
+                        bias=self.lm_head.bias,
+                        p_mask=training_batch["p_mask"],
+                    )
+                loss = loss / answer_len
             logits = None
         else:
             # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
