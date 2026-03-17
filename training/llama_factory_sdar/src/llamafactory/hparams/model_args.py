@@ -171,6 +171,62 @@ class BaseModelArguments:
         default=False,
         metadata={"help": "Whether to trust the execution of code from datasets/models defined on the Hub or not."},
     )
+    gap_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable GAP/remask teacher-forced rollout training for SDAR models."},
+    )
+    gap_training_mode: Optional[Literal["remask", "puma"]] = field(
+        default=None,
+        metadata={"help": "Training objective variant for GAP: remask novelty or pure PUMA-style teacher-forced rollout."},
+    )
+    gap_puma_streaming: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Whether to keep a streaming teacher-forced chain buffer when GAP training mode is PUMA."},
+    )
+    gap_rollout_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of rollout denoising steps before GAP projection. Defaults to block_size."},
+    )
+    gap_rollout_strategy: Optional[Literal["sequential", "low_confidence_static", "low_confidence_dynamic"]] = field(
+        default=None,
+        metadata={"help": "Token reveal strategy used during GAP teacher-forced rollout."},
+    )
+    gap_rollout_confidence_threshold: Optional[float] = field(
+        default=None,
+        metadata={"help": "Confidence threshold for dynamic GAP rollout token reveal."},
+    )
+    gap_rollout_scope: Optional[Literal["all", "frontier_block"]] = field(
+        default=None,
+        metadata={"help": "Scope of tokens eligible for GAP rollout reveals during training."},
+    )
+    gap_reveal_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Fraction of masked tokens selected as GAP remask candidates."},
+    )
+    gap_min_reveal_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Minimum number of candidate tokens selected per sample in GAP remask training."},
+    )
+    gap_remask_threshold: Optional[float] = field(
+        default=None,
+        metadata={"help": "Sigmoid threshold used to turn GAP remask logits into remask decisions."},
+    )
+    gap_remask_loss_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Loss weight applied to the GAP remask classification loss."},
+    )
+    gap_global_loss_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Auxiliary diffusion loss weight applied to masked targets outside the frontier scope."},
+    )
+    gap_remask_default_p_mask: Optional[float] = field(
+        default=None,
+        metadata={"help": "Fallback p_mask assigned to projected GAP remask tokens."},
+    )
+    gap_remask_scope: Optional[Literal["all", "frontier_block"]] = field(
+        default=None,
+        metadata={"help": "Scope of tokens eligible for GAP remask candidate selection during training."},
+    )
 
     def __post_init__(self):
         if self.model_name_or_path is None:

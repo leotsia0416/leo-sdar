@@ -5,6 +5,7 @@ from opencompass.datasets import (
     IFEvaluator,
     MATHEvaluator,
     gsm8k_dataset_postprocess,
+    math_postprocess_sdar,
     math_postprocess_v2,
 )
 from opencompass.models import LMDeploywithChatTemplate
@@ -101,20 +102,24 @@ else:
                             dict(
                                 role='HUMAN',
                                 prompt=(
-                                    '{question}\nPlease reason step by step, '
-                                    'and put your final answer within '
-                                    '\\boxed{}.'
+                                    '{question}\nSolve the problem step by step, '
+                                    'but keep the reasoning concise. Once you '
+                                    'know the answer, put the final answer '
+                                    'within \\boxed{} and stop immediately. '
+                                    'Do not provide alternative '
+                                    'interpretations, repeated checks, or any '
+                                    'text after the boxed answer.'
                                 ),
                             ),
                         ],
                     ),
                 ),
                 retriever=dict(type=ZeroRetriever),
-                inferencer=dict(type=GenInferencer),
+                inferencer=dict(type=GenInferencer, max_out_len=MAX_NEW_TOKENS),
             ),
             eval_cfg=dict(
                 evaluator=dict(type=MATHEvaluator, version='v2'),
-                pred_postprocessor=dict(type=math_postprocess_v2),
+                pred_postprocessor=dict(type=math_postprocess_sdar),
                 dataset_postprocessor=dict(type=gsm8k_dataset_postprocess),
             ),
         )
@@ -133,7 +138,7 @@ ifeval_datasets = [
                 template=dict(round=[dict(role='HUMAN', prompt='{prompt}')]),
             ),
             retriever=dict(type=ZeroRetriever),
-            inferencer=dict(type=GenInferencer),
+            inferencer=dict(type=GenInferencer, max_out_len=MAX_NEW_TOKENS),
         ),
         eval_cfg=dict(
             evaluator=dict(type=IFEvaluator),

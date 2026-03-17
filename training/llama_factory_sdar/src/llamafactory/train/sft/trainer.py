@@ -83,6 +83,21 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             self.compute_loss_func = dft_loss_func
 
+        self._loss_metric_sums: dict[str, torch.Tensor] = {}
+        self._loss_metric_last_logged_step = 0
+        self._puma_streaming_micro_step = 0
+
+    @override
+    def _wrap_model(self, model, training: bool = True, dataloader=None):
+        model = super()._wrap_model(model, training=training, dataloader=dataloader)
+
+        ddp_handler = getattr(self.accelerator, "ddp_handler", None)
+        if training and ddp_handler is not None and getattr(model, "is_gradient_checkpointing", False):
+            ddp_handler.static_graph = True
+            logger.info_rank0("Enabled DDP static graph to support gradient checkpointing safely.")
+
+        return model
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -105,7 +120,70 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+        self._configure_puma_streaming(model, inputs)
+        result = super().compute_loss(model, inputs, *args, **kwargs)
+        self._accumulate_loss_metrics(model)
+        return result
+
+    def _configure_puma_streaming(self, model: "torch.nn.Module", inputs: dict[str, Any]) -> None:
+        raw_model = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+        config = getattr(raw_model, "config", None)
+        if (
+            config is None
+            or not getattr(config, "gap_enable", False)
+            or getattr(config, "gap_training_mode", None) != "puma"
+            or not getattr(config, "gap_puma_streaming", True)
+            or not hasattr(raw_model, "set_puma_streaming_context")
+        ):
+            return
+
+        input_ids = inputs.get("input_ids")
+        if input_ids is None or input_ids.ndim != 2:
+            return
+
+        micro_batch_size = int(input_ids.size(0))
+        base_batch_size = int(getattr(self.args, "per_device_train_batch_size", micro_batch_size) or micro_batch_size)
+        grad_accum = max(1, int(self.args.gradient_accumulation_steps))
+        buffer_size = base_batch_size * grad_accum
+        slot_offset = (self._puma_streaming_micro_step % grad_accum) * base_batch_size
+        raw_model.set_puma_streaming_context(
+            slot_offset=slot_offset,
+            buffer_size=max(buffer_size, micro_batch_size),
+        )
+        self._puma_streaming_micro_step += 1
+
+    def _accumulate_loss_metrics(self, model: "torch.nn.Module") -> None:
+        raw_model = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+        metrics = getattr(raw_model, "_last_loss_metrics", None)
+        if not metrics:
+            return
+
+        for name, value in metrics.items():
+            if not torch.is_tensor(value):
+                value = torch.tensor(value, device=self.args.device)
+
+            metric_value = value.detach().float().clone()
+            if self.args.gradient_accumulation_steps > 1:
+                metric_value = metric_value / self.args.gradient_accumulation_steps
+
+            if name in self._loss_metric_sums:
+                self._loss_metric_sums[name] += metric_value
+            else:
+                self._loss_metric_sums[name] = metric_value
+
+    @override
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        if "loss" in logs and self._loss_metric_sums:
+            steps_since_last_log = self.state.global_step - self._loss_metric_last_logged_step
+            if steps_since_last_log > 0:
+                for name, value in self._loss_metric_sums.items():
+                    metric_scalar = self._nested_gather(value).mean().item()
+                    logs[name] = round(metric_scalar / steps_since_last_log, 4)
+
+            self._loss_metric_sums.clear()
+            self._loss_metric_last_logged_step = self.state.global_step
+
+        super().log(logs, start_time)
 
     @override
     def prediction_step(

@@ -65,8 +65,10 @@ from .configuration_sdar import SDARConfig
 from .fused_linear_diffusion_cross_entropy import FusedLinearDiffusionCrossEntropyLoss
 from .gap_sdar_training import (
     apply_gap_remask,
+    build_rollout_scope_mask,
     build_rollout_p_mask,
     get_num_transfer_tokens,
+    select_policy_transfer_tokens,
     select_teacher_forced_rollout_tokens,
 )
 
@@ -808,6 +810,10 @@ class SDARModel(SDARPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        r"""
+        store_kv (`bool`, *optional*):
+            Whether to keep KV states in the custom SDAR cache path during generation/inference.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1088,6 +1094,8 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(
             config.hidden_size, config.vocab_size, bias=False)
         self.gap_remask_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self._puma_streaming_state = None
+        self._puma_streaming_context = {"slot_offset": 0, "buffer_size": None}
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1109,6 +1117,37 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
+
+    def set_puma_streaming_context(self, slot_offset: int, buffer_size: int) -> None:
+        self._puma_streaming_context = {
+            "slot_offset": max(int(slot_offset), 0),
+            "buffer_size": max(int(buffer_size), 1),
+        }
+
+    def reset_puma_streaming_state(self) -> None:
+        self._puma_streaming_state = None
+        self._puma_streaming_context = {"slot_offset": 0, "buffer_size": None}
+
+    def _ensure_puma_streaming_state(self, buffer_size, inputs_ids, labels, position_ids):
+        expected_shape = (buffer_size, inputs_ids.shape[1])
+        state = self._puma_streaming_state
+        if (
+            state is None
+            or tuple(state["clean_input_ids"].shape) != expected_shape
+            or state["clean_input_ids"].device != inputs_ids.device
+            or state["clean_input_ids"].dtype != inputs_ids.dtype
+        ):
+            state = {
+                "clean_input_ids": torch.zeros(expected_shape, dtype=inputs_ids.dtype, device=inputs_ids.device),
+                "labels": torch.full(expected_shape, -100, dtype=labels.dtype, device=labels.device),
+                "position_ids": torch.zeros(expected_shape, dtype=position_ids.dtype, device=position_ids.device),
+                "noisy_inputs_ids": torch.zeros(expected_shape, dtype=inputs_ids.dtype, device=inputs_ids.device),
+                "stages": torch.full((buffer_size,), self.config.block_size, dtype=torch.long, device=inputs_ids.device),
+                "active": torch.zeros(buffer_size, dtype=torch.bool, device=inputs_ids.device),
+            }
+            self._puma_streaming_state = state
+
+        return state
 
     def build_bd_training_inputs(self, inputs_ids, noisy_inputs_ids, position_ids, logits_to_keep_half, num_tokens=None):
         bsz, seq_len = inputs_ids.shape
@@ -1175,6 +1214,124 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             "num_tokens": num_tokens,
         }
 
+    def prepare_for_puma_streaming_training(self, inputs_ids, labels, position_ids):
+        batch_size = inputs_ids.shape[0]
+        rollout_steps = int(getattr(self.config, "gap_rollout_steps", self.config.block_size))
+        rollout_steps = max(1, rollout_steps)
+        transfer_schedule = get_num_transfer_tokens(self.config.block_size, rollout_steps).to(inputs_ids.device)
+        context = getattr(self, "_puma_streaming_context", {}) or {}
+        buffer_size = int(context.get("buffer_size") or batch_size)
+        slot_offset = int(context.get("slot_offset", 0))
+        slot_indices = (torch.arange(batch_size, device=inputs_ids.device) + slot_offset) % buffer_size
+        state = self._ensure_puma_streaming_state(buffer_size, inputs_ids, labels, position_ids)
+
+        need_refill = (~state["active"][slot_indices]) | (state["stages"][slot_indices] >= rollout_steps)
+        if need_refill.any():
+            refill_slots = slot_indices[need_refill]
+            refill_inputs = inputs_ids[need_refill].detach().clone()
+            refill_labels = labels[need_refill].detach().clone()
+            refill_position_ids = position_ids[need_refill].detach().clone()
+            refill_answer_mask = refill_labels.ne(-100)
+            refill_noisy = torch.where(
+                refill_answer_mask,
+                torch.full_like(refill_inputs, self.config.mask_token_id),
+                refill_inputs,
+            )
+            state["clean_input_ids"][refill_slots] = refill_inputs
+            state["labels"][refill_slots] = refill_labels
+            state["position_ids"][refill_slots] = refill_position_ids
+            state["noisy_inputs_ids"][refill_slots] = refill_noisy
+            state["stages"][refill_slots] = 0
+            state["active"][refill_slots] = True
+
+        clean_input_ids = state["clean_input_ids"][slot_indices].clone()
+        clean_labels = state["labels"][slot_indices].clone()
+        clean_position_ids = state["position_ids"][slot_indices].clone()
+        noisy_inputs_ids = state["noisy_inputs_ids"][slot_indices].clone()
+        current_stages = state["stages"][slot_indices].clone()
+        num_tokens = calculate_token_nums(clean_position_ids)
+        target_scope_mask = clean_labels.ne(-100)
+        logits_to_keep_half = noisy_inputs_ids.eq(self.config.mask_token_id) & target_scope_mask
+        if not logits_to_keep_half.any() and target_scope_mask.any():
+            fallback_index = torch.nonzero(target_scope_mask, as_tuple=False)[0]
+            noisy_inputs_ids[fallback_index[0], fallback_index[1]] = self.config.mask_token_id
+            logits_to_keep_half[fallback_index[0], fallback_index[1]] = True
+
+        p_mask = build_rollout_p_mask(
+            masked_indices=logits_to_keep_half,
+            labels=clean_labels,
+            num_tokens=num_tokens,
+            target_scope_mask=target_scope_mask,
+            per_block=True,
+            block_size=self.config.block_size,
+        )
+        concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, _ = self.build_bd_training_inputs(
+            inputs_ids=clean_input_ids,
+            noisy_inputs_ids=noisy_inputs_ids,
+            position_ids=clean_position_ids,
+            logits_to_keep_half=logits_to_keep_half,
+            num_tokens=num_tokens,
+        )
+
+        return {
+            "concat_inputs_ids": concat_inputs_ids,
+            "concat_position_ids": concat_position_ids,
+            "flex_attention_mask_3d": flex_attention_mask_3d,
+            "logits_to_keep_half": logits_to_keep_half,
+            "logits_to_keep": logits_to_keep,
+            "p_mask": p_mask,
+            "noisy_inputs_ids": noisy_inputs_ids,
+            "num_tokens": num_tokens,
+            "target_scope_mask": target_scope_mask,
+            "loss_target_count": target_scope_mask.sum().clamp_min(1),
+            "gap_training_mode": "puma",
+            "rollout_depth": current_stages.float(),
+            "next_transfer_tokens": transfer_schedule[current_stages.clamp_max(rollout_steps - 1)],
+            "rollout_strategy": getattr(self.config, "gap_rollout_strategy", "low_confidence_dynamic"),
+            "rollout_confidence_threshold": float(getattr(self.config, "gap_rollout_confidence_threshold", 0.95)),
+            "clean_input_ids": clean_input_ids,
+            "clean_labels": clean_labels,
+            "clean_position_ids": clean_position_ids,
+            "streaming_slot_indices": slot_indices,
+            "streaming_refills": need_refill.sum(),
+        }
+
+    def advance_puma_streaming_state(self, training_batch, proposal_scores_full):
+        state = self._puma_streaming_state
+        if state is None:
+            return
+
+        slot_indices = training_batch.get("streaming_slot_indices")
+        if slot_indices is None:
+            return
+
+        rollout_steps = int(getattr(self.config, "gap_rollout_steps", self.config.block_size))
+        rollout_steps = max(1, rollout_steps)
+        reveal_mask = select_teacher_forced_rollout_tokens(
+            masked_indices=training_batch["logits_to_keep_half"],
+            proposal_scores_full=proposal_scores_full,
+            num_tokens=training_batch["num_tokens"],
+            block_size=self.config.block_size,
+            num_transfer_tokens=training_batch["next_transfer_tokens"],
+            strategy=training_batch["rollout_strategy"],
+            confidence_threshold=training_batch["rollout_confidence_threshold"],
+            scope=getattr(self.config, "gap_rollout_scope", "all"),
+        )
+        next_noisy_inputs_ids = training_batch["noisy_inputs_ids"].clone()
+        next_noisy_inputs_ids[reveal_mask] = training_batch["clean_input_ids"][reveal_mask]
+        next_stages = training_batch["rollout_depth"].to(torch.long) + 1
+        finished_mask = next_stages >= rollout_steps
+        finished_mask |= ~(next_noisy_inputs_ids.eq(self.config.mask_token_id) & training_batch["clean_labels"].ne(-100)).any(dim=1)
+        next_stages = torch.where(
+            finished_mask,
+            torch.full_like(next_stages, rollout_steps),
+            next_stages,
+        )
+
+        state["noisy_inputs_ids"][slot_indices] = next_noisy_inputs_ids.detach()
+        state["stages"][slot_indices] = next_stages
+        state["active"][slot_indices] = True
+
     def prepare_for_teacher_forced_rollout_training(
         self,
         inputs_ids,
@@ -1188,6 +1345,10 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
     ):
         num_tokens = calculate_token_nums(position_ids)
         answer_mask = ~prompt_mask
+        gap_training_mode = getattr(self.config, "gap_training_mode", "remask")
+        if gap_training_mode == "puma" and getattr(self.config, "gap_puma_streaming", True):
+            return self.prepare_for_puma_streaming_training(inputs_ids, labels, position_ids)
+
         noisy_inputs_ids = torch.where(
             answer_mask,
             torch.full_like(inputs_ids, self.config.mask_token_id),
@@ -1200,6 +1361,9 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         rollout_depth = int(torch.randint(0, rollout_steps, (1,), device=inputs_ids.device).item())
         rollout_strategy = getattr(self.config, "gap_rollout_strategy", "low_confidence_dynamic")
         rollout_confidence_threshold = float(getattr(self.config, "gap_rollout_confidence_threshold", 0.95))
+        default_rollout_scope = "all" if gap_training_mode == "puma" else "frontier_block"
+        rollout_scope = getattr(self.config, "gap_rollout_scope", default_rollout_scope)
+        completed_steps = 0
 
         for step_idx in range(rollout_depth):
             masked_indices = noisy_inputs_ids.eq(self.config.mask_token_id) & answer_mask
@@ -1245,20 +1409,41 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 num_transfer_tokens=int(transfer_schedule[step_idx]),
                 strategy=rollout_strategy,
                 confidence_threshold=rollout_confidence_threshold,
+                scope=rollout_scope,
             )
             if not reveal_mask.any():
                 break
             noisy_inputs_ids[reveal_mask] = inputs_ids[reveal_mask]
+            completed_steps += 1
 
-        logits_to_keep_half = noisy_inputs_ids.eq(self.config.mask_token_id) & answer_mask
+        remaining_masked = noisy_inputs_ids.eq(self.config.mask_token_id) & answer_mask
+        if gap_training_mode == "puma":
+            target_scope_mask = labels.ne(-100)
+            logits_to_keep_half = remaining_masked
+        else:
+            target_scope_mask = build_rollout_scope_mask(
+                masked_indices=remaining_masked,
+                reference_mask=labels.ne(-100),
+                num_tokens=num_tokens,
+                block_size=self.config.block_size,
+                scope=rollout_scope,
+            )
+            logits_to_keep_half = remaining_masked & target_scope_mask
         if not logits_to_keep_half.any() and answer_mask.any():
-            fallback_index = torch.nonzero(answer_mask, as_tuple=False)[0]
+            fallback_mask = target_scope_mask if target_scope_mask.any() else labels.ne(-100)
+            if not fallback_mask.any():
+                fallback_mask = answer_mask
+            fallback_index = torch.nonzero(fallback_mask, as_tuple=False)[0]
             noisy_inputs_ids[fallback_index[0], fallback_index[1]] = self.config.mask_token_id
             logits_to_keep_half[fallback_index[0], fallback_index[1]] = True
+            target_scope_mask[fallback_index[0], fallback_index[1]] = labels[fallback_index[0], fallback_index[1]].ne(-100)
         p_mask = build_rollout_p_mask(
             masked_indices=logits_to_keep_half,
             labels=labels,
             num_tokens=num_tokens,
+            target_scope_mask=target_scope_mask,
+            per_block=(gap_training_mode == "puma"),
+            block_size=self.config.block_size,
         )
         concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, _ = self.build_bd_training_inputs(
             inputs_ids=inputs_ids,
@@ -1277,7 +1462,13 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             "p_mask": p_mask,
             "noisy_inputs_ids": noisy_inputs_ids,
             "num_tokens": num_tokens,
-            "rollout_depth": rollout_depth,
+            "target_scope_mask": target_scope_mask,
+            "loss_target_count": target_scope_mask.sum().clamp_min(1),
+            "gap_training_mode": gap_training_mode,
+            "rollout_depth": completed_steps,
+            "next_transfer_tokens": int(transfer_schedule[min(completed_steps, rollout_steps - 1)]),
+            "rollout_strategy": rollout_strategy,
+            "rollout_confidence_threshold": rollout_confidence_threshold,
         }
 
     @can_return_tuple
@@ -1344,6 +1535,9 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 )
             else:
                 training_batch = self.prepare_for_bd_training(input_ids, position_ids, prompt_mask)
+            train_input_ids = training_batch.get("clean_input_ids", input_ids)
+            train_labels = training_batch.get("clean_labels", labels)
+            train_position_ids = training_batch.get("clean_position_ids", position_ids)
             outputs = self.model(
                 input_ids=training_batch["concat_inputs_ids"],
                 attention_mask=training_batch["flex_attention_mask_3d"],
@@ -1355,37 +1549,115 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
             hidden_states = outputs.last_hidden_state
-            assert labels is not None, "Labels must be provided for training."
-            answer_len = (labels != -100).sum()
+            assert train_labels is not None, "Labels must be provided for training."
+            answer_len = (train_labels != -100).sum()
             hidden_states = hidden_states[training_batch["logits_to_keep"]].contiguous()
-            if getattr(self.config, "gap_enable", False):
+            p_mask = training_batch["p_mask"]
+            rollout_depth_metric = training_batch.get("rollout_depth", 0)
+            if torch.is_tensor(rollout_depth_metric):
+                rollout_depth_metric = rollout_depth_metric.detach().to(torch.float32).mean()
+            else:
+                rollout_depth_metric = hidden_states.new_tensor(float(rollout_depth_metric))
+            if getattr(self.config, "gap_enable", False) and training_batch.get("gap_training_mode") == "puma":
+                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
+                diffusion_obj = loss_fct(
+                    x=hidden_states,
+                    target=train_labels[training_batch["logits_to_keep_half"]].contiguous(),
+                    weight=self.lm_head.weight,
+                    bias=self.lm_head.bias,
+                    p_mask=training_batch["p_mask"],
+                )
+                diffusion_loss = diffusion_obj / answer_len.to(diffusion_obj.dtype)
+                if "streaming_slot_indices" in training_batch:
+                    proposal_logits = self.lm_head(hidden_states).float()
+                    proposal_ids = proposal_logits.argmax(dim=-1)
+                    proposal_scores = (
+                        proposal_logits.gather(-1, proposal_ids.unsqueeze(-1)).squeeze(-1)
+                        - torch.logsumexp(proposal_logits, dim=-1)
+                    ).exp()
+                    proposal_scores_full = torch.full(
+                        training_batch["noisy_inputs_ids"].shape,
+                        float("-inf"),
+                        dtype=proposal_scores.dtype,
+                        device=proposal_scores.device,
+                    )
+                    proposal_scores_full[training_batch["logits_to_keep_half"]] = proposal_scores
+                    self.advance_puma_streaming_state(training_batch, proposal_scores_full)
+                loss = diffusion_loss
+                streaming_refills_metric = training_batch.get("streaming_refills", 0)
+                if torch.is_tensor(streaming_refills_metric):
+                    streaming_refills_metric = streaming_refills_metric.detach().to(torch.float32)
+                else:
+                    streaming_refills_metric = hidden_states.new_tensor(float(streaming_refills_metric))
+                self._last_loss_metrics = {
+                    "rollout_depth": rollout_depth_metric,
+                    "streaming_refills": streaming_refills_metric,
+                }
+            elif getattr(self.config, "gap_enable", False):
                 proposal_logits = self.lm_head(hidden_states).float()
                 proposal_ids = proposal_logits.argmax(dim=-1)
                 proposal_scores = (
                     proposal_logits.gather(-1, proposal_ids.unsqueeze(-1)).squeeze(-1)
                     - torch.logsumexp(proposal_logits, dim=-1)
                 ).exp()
+                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
+                preproj_frontier_loss = loss_fct(
+                    x=hidden_states,
+                    target=train_labels[training_batch["logits_to_keep_half"]].contiguous(),
+                    weight=self.lm_head.weight,
+                    bias=self.lm_head.bias,
+                    p_mask=training_batch["p_mask"],
+                )
+                preproj_diffusion_loss = preproj_frontier_loss / training_batch["loss_target_count"].to(preproj_frontier_loss.dtype)
+                proposal_scores_full = torch.full(
+                    training_batch["noisy_inputs_ids"].shape,
+                    float("-inf"),
+                    dtype=proposal_scores.dtype,
+                    device=proposal_scores.device,
+                )
+                proposal_scores_full[training_batch["logits_to_keep_half"]] = proposal_scores
+                remask_candidate_mask = select_policy_transfer_tokens(
+                    masked_indices=training_batch["logits_to_keep_half"],
+                    proposal_scores_full=proposal_scores_full,
+                    num_tokens=training_batch["num_tokens"],
+                    block_size=self.config.block_size,
+                    num_transfer_tokens=training_batch["next_transfer_tokens"],
+                    strategy=training_batch["rollout_strategy"],
+                    confidence_threshold=training_batch["rollout_confidence_threshold"],
+                    scope=getattr(self.config, "gap_remask_scope", "frontier_block"),
+                )
                 remask_logits = self.gap_remask_head(hidden_states).squeeze(-1)
                 gap_outputs = apply_gap_remask(
                     noisy_input_ids=training_batch["noisy_inputs_ids"],
-                    labels=labels,
+                    clean_input_ids=train_input_ids,
+                    labels=train_labels,
                     masked_indices=training_batch["logits_to_keep_half"],
                     p_mask=training_batch["p_mask"],
                     proposal_ids=proposal_ids,
-                    proposal_scores=proposal_scores,
                     remask_logits=remask_logits,
+                    candidate_mask_full=remask_candidate_mask,
                     mask_token_id=self.config.mask_token_id,
-                    reveal_ratio=getattr(self.config, "gap_reveal_ratio", 0.25),
-                    min_reveal_tokens=getattr(self.config, "gap_min_reveal_tokens", 1),
                     remask_threshold=getattr(self.config, "gap_remask_threshold", 0.5),
                     remask_loss_weight=getattr(self.config, "gap_remask_loss_weight", 1.0),
                     remask_default_p_mask=getattr(self.config, "gap_remask_default_p_mask", 1.0),
+                    target_scope_mask=training_batch["target_scope_mask"],
                 )
+                global_target_scope_mask = train_labels.ne(-100) & ~training_batch["target_scope_mask"]
+                global_projected_mask = gap_outputs.z_proj.eq(self.config.mask_token_id) & global_target_scope_mask
+                global_p_mask = None
+                if global_projected_mask.any():
+                    global_p_mask = build_rollout_p_mask(
+                        masked_indices=global_projected_mask,
+                        labels=train_labels,
+                        num_tokens=training_batch["num_tokens"],
+                        target_scope_mask=global_target_scope_mask,
+                    )
+                proj_loss_mask = gap_outputs.projected_mask | global_projected_mask
                 proj_concat_inputs_ids, proj_concat_position_ids, proj_flex_attention_mask_3d, proj_logits_to_keep_half, proj_logits_to_keep, _ = self.build_bd_training_inputs(
-                    inputs_ids=input_ids,
+                    inputs_ids=train_input_ids,
                     noisy_inputs_ids=gap_outputs.z_proj,
-                    position_ids=position_ids,
-                    logits_to_keep_half=gap_outputs.projected_mask,
+                    position_ids=train_position_ids,
+                    logits_to_keep_half=proj_loss_mask,
                     num_tokens=training_batch["num_tokens"],
                 )
                 proj_outputs = self.model(
@@ -1399,29 +1671,56 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                     **kwargs,
                 )
                 proj_hidden_states = proj_outputs.last_hidden_state[proj_logits_to_keep].contiguous()
-                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
-                loss = loss_fct(
-                    x=proj_hidden_states,
-                    target=labels[proj_logits_to_keep_half].contiguous(),
+                proj_targets = train_labels[proj_logits_to_keep_half].contiguous()
+                frontier_mask_flat = gap_outputs.projected_mask[proj_logits_to_keep_half]
+                frontier_loss = loss_fct(
+                    x=proj_hidden_states[frontier_mask_flat].contiguous(),
+                    target=proj_targets[frontier_mask_flat].contiguous(),
                     weight=self.lm_head.weight,
                     bias=self.lm_head.bias,
                     p_mask=gap_outputs.projected_p_mask,
                 )
-                loss = (loss / answer_len) + gap_outputs.remask_loss
+                diffusion_loss = frontier_loss / training_batch["loss_target_count"].to(frontier_loss.dtype)
+                global_loss = diffusion_loss.new_zeros(())
+                global_loss_weight = float(getattr(self.config, "gap_global_loss_weight", 0.0))
+                if global_loss_weight > 0.0 and global_projected_mask.any():
+                    global_mask_flat = global_projected_mask[proj_logits_to_keep_half]
+                    global_target_count = global_target_scope_mask.sum().clamp_min(1)
+                    global_loss = loss_fct(
+                        x=proj_hidden_states[global_mask_flat].contiguous(),
+                        target=proj_targets[global_mask_flat].contiguous(),
+                        weight=self.lm_head.weight,
+                        bias=self.lm_head.bias,
+                        p_mask=global_p_mask,
+                    )
+                    global_loss = global_loss / global_target_count.to(global_loss.dtype)
+                remask_loss = gap_outputs.remask_loss
+                loss = diffusion_loss + remask_loss + (global_loss_weight * global_loss)
+                remask_metrics = {
+                    "diffusion_loss": diffusion_loss.detach(),
+                    "remask_loss": remask_loss.detach(),
+                    "rollout_depth": rollout_depth_metric,
+                }
+                if global_loss_weight > 0.0:
+                    remask_metrics["global_loss"] = global_loss.detach()
+                self._last_loss_metrics = remask_metrics
             else:
                 loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
                 loss = loss_fct(  # it will return (sum_loss, unreduced_loss)
                         # conduct `view(-1, V)` inside the function
                         x=hidden_states,
-                        target=labels[training_batch["logits_to_keep_half"]].contiguous(),
+                        target=train_labels[training_batch["logits_to_keep_half"]].contiguous(),
                         weight=self.lm_head.weight,
                         bias=self.lm_head.bias,
                         p_mask=training_batch["p_mask"],
                     )
-                loss = loss / answer_len
+                diffusion_loss = loss / answer_len
+                loss = diffusion_loss
+                self._last_loss_metrics = None
             logits = None
         else:
             # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            self._last_loss_metrics = None
             outputs: BaseModelOutputWithPast = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

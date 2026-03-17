@@ -6,8 +6,8 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=24
 #SBATCH --time=20:00:00
-#SBATCH -o SDAR_eval.out
-#SBATCH -e SDAR_eval.err
+#SBATCH -o /work/leotsia0416/projects/SDAR/logs/test_%j.out
+#SBATCH -e /work/leotsia0416/projects/SDAR/logs/test_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=leotsia.ee13@nycu.edu.tw
 
@@ -25,7 +25,7 @@ export SDAR_EVAL_GPUS="2"
 export SDAR_INFER_BATCH_SIZE="1"
 export SDAR_CONFIDENCE_THRESHOLD="0.95"
 export SDAR_BLOCK_LENGTH="4"
-export SDAR_MAX_NEW_TOKENS="1024"
+export SDAR_MAX_NEW_TOKENS="1536"
 export SDAR_WORK_DIR="./outputs/eval-chat-sdar"
 
 export HF_HOME="${SDAR_MODEL_ROOT}/hf"

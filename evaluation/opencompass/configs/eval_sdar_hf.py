@@ -1,4 +1,3 @@
-import torch
 from opencompass.datasets import (
     GSM8KDataset,
     IFEvalDataset,
@@ -113,7 +112,7 @@ for abbr, path, block_length, threshold, num_gpus in model_configs:
             threshold=threshold
         ),
         model_kwargs=dict(
-            torch_dtype=torch.float16,
+            torch_dtype='torch.float16',
             trust_remote_code=True,
         ),
     )

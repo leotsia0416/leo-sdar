@@ -1,5 +1,6 @@
 # flake8: noqa
 # yapf: disable
+import types
 from typing import Dict, List, Optional, Union
 
 from einops import rearrange
@@ -26,6 +27,109 @@ from transformers.cache_utils import (
     Cache,
     DynamicCache,
 )
+
+
+def _patch_block_diffusion_3d_mask(model):
+    inner_model = getattr(model, 'model', None)
+    if inner_model is None or not hasattr(inner_model, '_update_causal_mask'):
+        return
+    if getattr(inner_model, '_sdar_block_diffusion_mask_patched', False):
+        return
+
+    original_update_causal_mask = inner_model._update_causal_mask
+
+    def patched_update_causal_mask(
+        self,
+        attention_mask,
+        input_tensor,
+        cache_position,
+        past_key_values,
+        output_attentions=False,
+    ):
+        # OpenCompass block-diffusion wrappers pass a [B, Q, K] mask that
+        # already encodes the latest-block visibility pattern. Reinterpreting
+        # it as a 2D padding mask corrupts the diffusion attention layout.
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 3:
+            return attention_mask
+        return original_update_causal_mask(
+            attention_mask,
+            input_tensor,
+            cache_position,
+            past_key_values,
+            output_attentions,
+        )
+
+    inner_model._update_causal_mask = types.MethodType(
+        patched_update_causal_mask, inner_model
+    )
+    inner_model._sdar_block_diffusion_mask_patched = True
+
+
+def _should_fallback_variable_length_batch(tokens):
+    attention_mask = tokens.get('attention_mask')
+    if attention_mask is None or attention_mask.dim() != 2 or attention_mask.shape[0] <= 1:
+        return False
+    prompt_lengths = attention_mask.sum(dim=1)
+    return bool((prompt_lengths != prompt_lengths[0]).any().item())
+
+
+def _prepare_block_diffusion_batch(prompt, mask_id, gen_length, block_length, device):
+    input_ids = prompt['input_ids'].to(device)
+    batch_size, prompt_length = input_ids.shape
+
+    attention_mask = prompt.get('attention_mask')
+    if attention_mask is None:
+        attention_mask = torch.ones((batch_size, prompt_length), dtype=torch.long, device=device)
+    else:
+        attention_mask = attention_mask.to(device)
+    prompt_lengths = attention_mask.sum(dim=1, dtype=torch.long)
+
+    num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+    total_length = num_blocks * block_length
+
+    block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=device), diagonal=0)
+    block_diffusion_attention_mask = (
+        block_mask.repeat_interleave(block_length, dim=0)
+        .repeat_interleave(block_length, dim=1)
+        .unsqueeze(0)
+        .unsqueeze(1)
+        .expand(batch_size, -1, -1, -1)
+        .clone()
+    )
+
+    valid_positions = torch.ones(
+        (batch_size, total_length),
+        dtype=block_diffusion_attention_mask.dtype,
+        device=device,
+    )
+    valid_positions[:, :prompt_length] = attention_mask.to(block_diffusion_attention_mask.dtype)
+    block_diffusion_attention_mask *= valid_positions[:, None, None, :]
+    block_diffusion_attention_mask *= valid_positions[:, None, :, None]
+
+    invalid_prefix = attention_mask.eq(0)
+    if invalid_prefix.any():
+        batch_idx, q_idx = invalid_prefix.nonzero(as_tuple=True)
+        block_diffusion_attention_mask[batch_idx, 0, q_idx, q_idx] = 1
+
+    position_ids = torch.zeros((batch_size, total_length), dtype=torch.long, device=device)
+    prefix_positions = attention_mask.cumsum(dim=1, dtype=torch.long) - 1
+    prefix_positions.masked_fill_(attention_mask.eq(0), 0)
+    position_ids[:, :prompt_length] = prefix_positions
+    if total_length > prompt_length:
+        generation_offsets = torch.arange(total_length - prompt_length, dtype=torch.long, device=device).unsqueeze(0)
+        position_ids[:, prompt_length:] = prompt_lengths.unsqueeze(1) + generation_offsets
+
+    x = torch.full((batch_size, total_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_length] = input_ids.clone()
+
+    return (
+        input_ids,
+        prompt_length,
+        total_length,
+        block_diffusion_attention_mask,
+        position_ids,
+        x,
+    )
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -69,8 +173,13 @@ def sample_with_temperature_topk_topp(logits, temperature=1.0, top_k=0, top_p=1.
 
     logits = logits.reshape(-1, vocab_size)  # [batch*block, vocab]
 
+    if temperature <= 0:
+        ori_probs = F.softmax(logits, dim=-1)
+        token = torch.argmax(logits, dim=-1, keepdim=True)
+        token_prob = torch.gather(ori_probs, -1, token)
+        return token.view(*orig_shape), token_prob.view(*orig_shape)
+
     # 1️⃣ 原始概率：先应用温度，然后 softmax
-    assert temperature > 0, "Temperature must be positive"
     logits = logits / temperature if temperature != 1.0 else logits
     ori_probs = F.softmax(logits, dim=-1)  # 用于置信度排序
 
@@ -135,33 +244,11 @@ def block_diffusion_generate(
         mask_id: The toke id of [MASK]
     '''
 
-    # 仅仅支持单个输入，不支持 batch inference
-    input_ids = prompt['input_ids']
-    prompt_length = input_ids.shape[1]
-    attention_mask = prompt['attention_mask']
-    tokenizer = tokenizer
-    past_key_values = DynamicCache()
-
-    # prepare block_diag and position_ids
-    num_blocks = (input_ids.shape[1] + gen_length + block_length - 1) // block_length
-    total_length = num_blocks * block_length
-    # 生成块级下三角掩码（num_blocks × num_blocks）
-    block_mask = torch.tril(
-        torch.ones(num_blocks, num_blocks, device=model.device),
-        diagonal=0
+    input_ids, prompt_length, total_length, block_diffusion_attention_mask, position_ids, x = (
+        _prepare_block_diffusion_batch(prompt, mask_id, gen_length, block_length, model.device)
     )
-    # 扩展到每个块内部（变成 total_length × total_length）
-    block_diffusion_attention_mask = block_mask.repeat_interleave(block_length, dim=0) \
-                                .repeat_interleave(block_length, dim=1) \
-                                .unsqueeze(0)  # 添加 batch 维度
-
-    position_ids = torch.arange(
-        0, total_length, dtype=torch.long, device=input_ids.device).unsqueeze(0)
-
-    # prepare input_ids
-    x = torch.full((input_ids.shape[0], total_length),
-                   mask_id, dtype=torch.long).to(model.device)
-    x[:, :input_ids.shape[1]] = input_ids.clone()
+    past_key_values = DynamicCache()
+    num_blocks = total_length // block_length
 
     # calculate prefill_length
     prefill_blocks = input_ids.shape[1] // block_length
@@ -171,7 +258,7 @@ def block_diffusion_generate(
     if prefill_length > 0:
         # 预填充阶段，计算得到 kv cache
         cur_x = x[:, :prefill_length]
-        cur_attn_mask = block_diffusion_attention_mask[:, :prefill_length, :prefill_length]
+        cur_attn_mask = block_diffusion_attention_mask[:, :, :prefill_length, :prefill_length]
         cur_position_ids = position_ids[:, :prefill_length]
         _ = model(
             input_ids=cur_x,
@@ -185,10 +272,15 @@ def block_diffusion_generate(
     assert block_length % denoising_steps == 0 and block_length >= denoising_steps
     num_transfer_tokens = get_num_transfer_tokens(block_length, denoising_steps)
     end_generate = False
+    finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=x.device)
     for num_block in range(prefill_blocks, num_blocks):
         cur_x = x[:, num_block * block_length: (num_block + 1) * block_length]
-        cur_attn_mask = block_diffusion_attention_mask[:, num_block *
-            block_length: (num_block + 1) * block_length, :(num_block + 1) * block_length]
+        cur_attn_mask = block_diffusion_attention_mask[
+            :,
+            :,
+            num_block * block_length: (num_block + 1) * block_length,
+            :(num_block + 1) * block_length,
+        ]
         cur_position_ids = position_ids[:, num_block * block_length: (num_block + 1) * block_length]
         for i in range(denoising_steps + 1): # 有一步需要专门用于缓存 kv cache，后续可以优化掉
             mask_index = (cur_x == mask_id)
@@ -262,10 +354,11 @@ def block_diffusion_generate(
                 cur_x[transfer_index] = x0[transfer_index]
 
         x[:, num_block * block_length: (num_block + 1) * block_length] = cur_x
-        for stop_idx in stopping_criteria_idx:
-            if stop_idx in x[:, prompt_length:]:
-                end_generate = True
-                break
+        if stopping_criteria_idx is not None:
+            generated_prefix = x[:, prompt_length: (num_block + 1) * block_length]
+            for stop_idx in stopping_criteria_idx:
+                finished |= generated_prefix.eq(stop_idx).any(dim=1)
+            end_generate = bool(finished.all().item())
         if end_generate:
             break
 
@@ -520,6 +613,7 @@ class BD3withChatTemplate(BaseModel):
         print(f"model configs:\n{self.model.config}")
         print(f"model 参数类型: {next(self.model.parameters()).dtype}")
         self.model.eval()
+        _patch_block_diffusion_3d_mask(self.model)
         self.model.generation_config.do_sample = False
 
     def get_ppl_tokenwise(self, inputs: List[str], label: List[List[int]], mask_length: Optional[List[int]] = None) -> List[float]:

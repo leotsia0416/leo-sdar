@@ -102,6 +102,26 @@ def patch_config(
         else:
             model_args.compute_dtype = infer_optim_dtype(model_dtype=getattr(config, "torch_dtype", None))
 
+    setattr(config, "gap_enable", model_args.gap_enable)
+    gap_optional_args = {
+        "gap_training_mode": model_args.gap_training_mode,
+        "gap_puma_streaming": model_args.gap_puma_streaming,
+        "gap_rollout_steps": model_args.gap_rollout_steps,
+        "gap_rollout_strategy": model_args.gap_rollout_strategy,
+        "gap_rollout_confidence_threshold": model_args.gap_rollout_confidence_threshold,
+        "gap_rollout_scope": model_args.gap_rollout_scope,
+        "gap_reveal_ratio": model_args.gap_reveal_ratio,
+        "gap_min_reveal_tokens": model_args.gap_min_reveal_tokens,
+        "gap_remask_threshold": model_args.gap_remask_threshold,
+        "gap_remask_loss_weight": model_args.gap_remask_loss_weight,
+        "gap_global_loss_weight": model_args.gap_global_loss_weight,
+        "gap_remask_default_p_mask": model_args.gap_remask_default_p_mask,
+        "gap_remask_scope": model_args.gap_remask_scope,
+    }
+    for attr_name, attr_value in gap_optional_args.items():
+        if attr_value is not None:
+            setattr(config, attr_name, attr_value)
+
     configure_attn_implementation(config, model_args)
     configure_rope(config, model_args)
     configure_longlora(config, model_args, is_trainable)

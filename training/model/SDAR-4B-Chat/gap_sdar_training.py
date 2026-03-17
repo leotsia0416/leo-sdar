@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-import math
-from typing import Dict
+from typing import Dict, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +10,7 @@ class GapRemaskOutputs:
     full_candidate_mask: torch.BoolTensor
     remask_target_flat: torch.BoolTensor
     remask_pred_full: torch.BoolTensor
-    z_raw: torch.LongTensor
+    z_accept: torch.LongTensor
     z_proj: torch.LongTensor
     projected_mask: torch.BoolTensor
     projected_p_mask: torch.FloatTensor
@@ -47,24 +46,80 @@ def get_num_transfer_tokens(block_length: int, steps: int) -> torch.LongTensor:
     return num_transfer_tokens
 
 
-def select_teacher_forced_rollout_tokens(
+def _select_block_positions(
+    block_scores: torch.FloatTensor,
+    masked_local_indices: torch.LongTensor,
+    num_transfer_tokens: int,
+    strategy: str,
+    confidence_threshold: float,
+) -> torch.LongTensor:
+    k = min(num_transfer_tokens, int(masked_local_indices.numel()))
+    if k <= 0:
+        return masked_local_indices[:0]
+
+    if strategy == "low_confidence_dynamic":
+        high_conf_mask = block_scores > confidence_threshold
+        if int(high_conf_mask.sum().item()) >= num_transfer_tokens:
+            return masked_local_indices[high_conf_mask]
+
+        topk = torch.topk(block_scores, k=k, sorted=False).indices
+        return masked_local_indices[topk]
+    if strategy == "low_confidence_static":
+        topk = torch.topk(block_scores, k=k, sorted=False).indices
+        return masked_local_indices[topk]
+    if strategy == "sequential":
+        return masked_local_indices[:k]
+
+    raise ValueError(f"Unsupported rollout strategy: {strategy}")
+
+
+def _resolve_num_transfer_tokens(
+    num_transfer_tokens: Union[int, torch.Tensor, Sequence[int]],
+    batch_idx: int,
+) -> int:
+    if torch.is_tensor(num_transfer_tokens):
+        if num_transfer_tokens.numel() == 1:
+            return int(num_transfer_tokens.item())
+        return int(num_transfer_tokens[batch_idx].item())
+
+    if isinstance(num_transfer_tokens, Sequence) and not isinstance(num_transfer_tokens, (str, bytes)):
+        if len(num_transfer_tokens) == 1:
+            return int(num_transfer_tokens[0])
+        return int(num_transfer_tokens[batch_idx])
+
+    return int(num_transfer_tokens)
+
+
+def select_policy_transfer_tokens(
     masked_indices: torch.BoolTensor,
     proposal_scores_full: torch.FloatTensor,
     num_tokens,
     block_size: int,
-    num_transfer_tokens: int,
+    num_transfer_tokens: Union[int, torch.Tensor, Sequence[int]],
     strategy: str = "low_confidence_dynamic",
     confidence_threshold: float = 0.95,
+    scope: str = "all",
 ) -> torch.BoolTensor:
+    if scope not in {"all", "frontier_block"}:
+        raise ValueError(f"Unsupported rollout scope: {scope}")
+
     reveal_mask = torch.zeros_like(masked_indices)
-    if num_transfer_tokens <= 0:
+    if torch.is_tensor(num_transfer_tokens):
+        if int(num_transfer_tokens.max().item()) <= 0:
+            return reveal_mask
+    elif isinstance(num_transfer_tokens, Sequence) and not isinstance(num_transfer_tokens, (str, bytes)):
+        if max(int(x) for x in num_transfer_tokens) <= 0:
+            return reveal_mask
+    elif int(num_transfer_tokens) <= 0:
         return reveal_mask
 
     for batch_idx, packed_lengths in enumerate(num_tokens):
+        current_num_transfer_tokens = _resolve_num_transfer_tokens(num_transfer_tokens, batch_idx)
         cursor = 0
         for sample_len_tensor in packed_lengths:
             sample_len = int(sample_len_tensor.item())
             sample_end = cursor + sample_len
+
             for block_start in range(cursor, sample_end, block_size):
                 block_end = min(block_start + block_size, sample_end)
                 block_mask = masked_indices[batch_idx, block_start:block_end]
@@ -73,33 +128,85 @@ def select_teacher_forced_rollout_tokens(
 
                 masked_local_indices = torch.nonzero(block_mask, as_tuple=False).flatten()
                 block_scores = proposal_scores_full[batch_idx, block_start:block_end][masked_local_indices]
-                k = min(num_transfer_tokens, int(masked_local_indices.numel()))
-
-                if strategy == "low_confidence_dynamic":
-                    high_conf_mask = block_scores > confidence_threshold
-                    if int(high_conf_mask.sum().item()) >= num_transfer_tokens:
-                        chosen = masked_local_indices[high_conf_mask]
-                    else:
-                        topk = torch.topk(block_scores, k=k, sorted=False).indices
-                        chosen = masked_local_indices[topk]
-                elif strategy == "low_confidence_static":
-                    topk = torch.topk(block_scores, k=k, sorted=False).indices
-                    chosen = masked_local_indices[topk]
-                elif strategy == "sequential":
-                    chosen = masked_local_indices[:k]
-                else:
-                    raise ValueError(f"Unsupported rollout strategy: {strategy}")
-
+                chosen = _select_block_positions(
+                    block_scores=block_scores,
+                    masked_local_indices=masked_local_indices,
+                    num_transfer_tokens=current_num_transfer_tokens,
+                    strategy=strategy,
+                    confidence_threshold=confidence_threshold,
+                )
                 reveal_mask[batch_idx, block_start:block_end][chosen] = True
+
+                if scope == "frontier_block":
+                    break
+
             cursor = sample_end
 
     return reveal_mask
+
+
+def select_teacher_forced_rollout_tokens(
+    masked_indices: torch.BoolTensor,
+    proposal_scores_full: torch.FloatTensor,
+    num_tokens,
+    block_size: int,
+    num_transfer_tokens: Union[int, torch.Tensor, Sequence[int]],
+    strategy: str = "low_confidence_dynamic",
+    confidence_threshold: float = 0.95,
+    scope: str = "all",
+) -> torch.BoolTensor:
+    return select_policy_transfer_tokens(
+        masked_indices=masked_indices,
+        proposal_scores_full=proposal_scores_full,
+        num_tokens=num_tokens,
+        block_size=block_size,
+        num_transfer_tokens=num_transfer_tokens,
+        strategy=strategy,
+        confidence_threshold=confidence_threshold,
+        scope=scope,
+    )
+
+
+def build_rollout_scope_mask(
+    masked_indices: torch.BoolTensor,
+    reference_mask: torch.BoolTensor,
+    num_tokens,
+    block_size: int,
+    scope: str = "all",
+) -> torch.BoolTensor:
+    if scope not in {"all", "frontier_block"}:
+        raise ValueError(f"Unsupported rollout scope: {scope}")
+
+    if scope == "all":
+        return reference_mask.clone()
+
+    scope_mask = torch.zeros_like(reference_mask)
+    for batch_idx, packed_lengths in enumerate(num_tokens):
+        cursor = 0
+        for sample_len_tensor in packed_lengths:
+            sample_len = int(sample_len_tensor.item())
+            sample_end = cursor + sample_len
+
+            for block_start in range(cursor, sample_end, block_size):
+                block_end = min(block_start + block_size, sample_end)
+                if not masked_indices[batch_idx, block_start:block_end].any():
+                    continue
+
+                scope_mask[batch_idx, block_start:block_end] = reference_mask[batch_idx, block_start:block_end]
+                break
+
+            cursor = sample_end
+
+    return scope_mask
 
 
 def build_rollout_p_mask(
     masked_indices: torch.BoolTensor,
     labels: torch.LongTensor,
     num_tokens,
+    target_scope_mask: Optional[torch.BoolTensor] = None,
+    per_block: bool = False,
+    block_size: Optional[int] = None,
     eps: float = 1e-3,
 ) -> torch.FloatTensor:
     p_mask_full = torch.full(masked_indices.shape, eps, dtype=torch.float32, device=masked_indices.device)
@@ -109,75 +216,59 @@ def build_rollout_p_mask(
         for sample_len_tensor in packed_lengths:
             sample_len = int(sample_len_tensor.item())
             sample_end = cursor + sample_len
-            sample_target_mask = labels[batch_idx, cursor:sample_end].ne(-100)
-            target_count = int(sample_target_mask.sum().item())
-            if target_count > 0:
-                sample_masked = masked_indices[batch_idx, cursor:sample_end] & sample_target_mask
-                sample_p_mask = max(sample_masked.sum().item() / target_count, eps)
-                p_mask_full[batch_idx, cursor:sample_end][sample_masked] = sample_p_mask
+            if per_block:
+                if block_size is None:
+                    raise ValueError("block_size must be provided when per_block=True")
+                for block_start in range(cursor, sample_end, block_size):
+                    block_end = min(block_start + block_size, sample_end)
+                    block_target_mask = labels[batch_idx, block_start:block_end].ne(-100)
+                    if target_scope_mask is not None:
+                        block_target_mask = block_target_mask & target_scope_mask[batch_idx, block_start:block_end]
+                    target_count = int(block_target_mask.sum().item())
+                    if target_count == 0:
+                        continue
+                    block_masked = masked_indices[batch_idx, block_start:block_end] & block_target_mask
+                    block_p_mask = max(block_masked.sum().item() / target_count, eps)
+                    p_mask_full[batch_idx, block_start:block_end][block_masked] = block_p_mask
+            else:
+                sample_target_mask = labels[batch_idx, cursor:sample_end].ne(-100)
+                if target_scope_mask is not None:
+                    sample_target_mask = sample_target_mask & target_scope_mask[batch_idx, cursor:sample_end]
+                target_count = int(sample_target_mask.sum().item())
+                if target_count > 0:
+                    sample_masked = masked_indices[batch_idx, cursor:sample_end] & sample_target_mask
+                    sample_p_mask = max(sample_masked.sum().item() / target_count, eps)
+                    p_mask_full[batch_idx, cursor:sample_end][sample_masked] = sample_p_mask
             cursor = sample_end
 
     return p_mask_full[masked_indices]
 
 
-def select_rollout_candidates(
-    masked_indices: torch.BoolTensor,
-    proposal_scores: torch.FloatTensor,
-    reveal_ratio: float,
-    min_reveal_tokens: int,
-) -> torch.BoolTensor:
-    candidate_mask = torch.zeros_like(proposal_scores, dtype=torch.bool)
-    offset = 0
-    for row in masked_indices:
-        row_count = int(row.sum().item())
-        if row_count == 0:
-            continue
-
-        row_scores = proposal_scores[offset : offset + row_count]
-        desired = max(min_reveal_tokens, math.ceil(row_count * reveal_ratio))
-        if row_count > 1:
-            desired = min(desired, row_count - 1)
-        else:
-            desired = min(desired, row_count)
-
-        if desired > 0:
-            topk = torch.topk(row_scores, k=desired, sorted=False).indices
-            candidate_mask[offset + topk] = True
-        offset += row_count
-
-    return candidate_mask
-
-
 def apply_gap_remask(
     noisy_input_ids: torch.LongTensor,
+    clean_input_ids: torch.LongTensor,
     labels: torch.LongTensor,
     masked_indices: torch.BoolTensor,
     p_mask: torch.FloatTensor,
     proposal_ids: torch.LongTensor,
-    proposal_scores: torch.FloatTensor,
     remask_logits: torch.FloatTensor,
+    candidate_mask_full: torch.BoolTensor,
     mask_token_id: int,
-    reveal_ratio: float,
-    min_reveal_tokens: int,
     remask_threshold: float,
     remask_loss_weight: float,
     remask_default_p_mask: float,
+    target_scope_mask: Optional[torch.BoolTensor] = None,
     ignore_index: int = -100,
 ) -> GapRemaskOutputs:
-    candidate_mask_flat = select_rollout_candidates(
-        masked_indices=masked_indices,
-        proposal_scores=proposal_scores,
-        reveal_ratio=reveal_ratio,
-        min_reveal_tokens=min_reveal_tokens,
-    )
-    full_candidate_mask = _scatter_flat_mask(masked_indices, candidate_mask_flat)
+    full_candidate_mask = candidate_mask_full & masked_indices
+    candidate_mask_flat = full_candidate_mask[masked_indices]
 
-    labels_flat = labels[masked_indices]
-    remask_target_flat = candidate_mask_flat & proposal_ids.ne(labels_flat)
+    clean_targets_flat = clean_input_ids[masked_indices]
+    remask_target_flat = candidate_mask_flat & proposal_ids.ne(clean_targets_flat)
 
-    z_raw = noisy_input_ids.clone()
+    z_accept = noisy_input_ids.clone()
     if candidate_mask_flat.any():
-        z_raw[full_candidate_mask] = proposal_ids[candidate_mask_flat]
+        z_accept[full_candidate_mask] = clean_input_ids[full_candidate_mask]
 
     candidate_logits = remask_logits[candidate_mask_flat]
     candidate_targets = remask_target_flat[candidate_mask_flat].float()
@@ -189,12 +280,21 @@ def apply_gap_remask(
         remask_loss = remask_logits.sum() * 0.0
 
     remask_pred_full = _scatter_flat_mask(masked_indices, remask_pred_flat)
-    z_proj = z_raw.clone()
+    z_proj = z_accept.clone()
     z_proj[remask_pred_full] = mask_token_id
 
-    projected_mask = z_proj.eq(mask_token_id) & labels.ne(ignore_index)
+    if target_scope_mask is None:
+        target_scope_mask = labels.ne(ignore_index)
+    else:
+        target_scope_mask = target_scope_mask & labels.ne(ignore_index)
+
+    projected_mask = z_proj.eq(mask_token_id) & target_scope_mask
     if not projected_mask.any():
-        fallback_mask = full_candidate_mask if full_candidate_mask.any() else masked_indices
+        fallback_mask = full_candidate_mask & target_scope_mask
+        if not fallback_mask.any():
+            fallback_mask = masked_indices & target_scope_mask
+        if not fallback_mask.any():
+            fallback_mask = target_scope_mask
         fallback_indices = torch.nonzero(fallback_mask, as_tuple=False)
         if fallback_indices.numel() > 0:
             row, col = fallback_indices[0].tolist()
@@ -224,7 +324,7 @@ def apply_gap_remask(
         full_candidate_mask=full_candidate_mask,
         remask_target_flat=remask_target_flat,
         remask_pred_full=remask_pred_full,
-        z_raw=z_raw,
+        z_accept=z_accept,
         z_proj=z_proj,
         projected_mask=projected_mask,
         projected_p_mask=projected_p_mask,

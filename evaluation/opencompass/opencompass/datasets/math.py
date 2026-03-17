@@ -201,6 +201,43 @@ def math_postprocess_v2(text: str) -> str:
     return normalize_final_answer(text.split('.')[0])
 
 
+def _extract_last_number(text: str):
+    matches = re.findall(r'-?\d[\d,]*(?:\.\d+)?', text)
+    if not matches:
+        return None
+    return matches[-1].replace(',', '')
+
+
+@TEXT_POSTPROCESSORS.register_module('math_postprocess_sdar')
+def math_postprocess_sdar(text: str) -> str:
+    cand_ans = extract_boxed_answer(text, strip_double_curly_brace=True)
+    if cand_ans:
+        last_number = _extract_last_number(cand_ans)
+        if last_number is not None:
+            return last_number
+        return normalize_final_answer(cand_ans)
+
+    for maybe_ans in text.split('.'):
+        if re.search('final answer|answer is', maybe_ans.lower()):
+            last_number = _extract_last_number(maybe_ans)
+            if last_number is not None:
+                return last_number
+            return normalize_final_answer(maybe_ans)
+
+    if '</think>' in text:
+        suffix = text.rsplit('</think>', 1)[-1]
+        last_number = _extract_last_number(suffix)
+        if last_number is not None:
+            return last_number
+
+    tail = text[-256:]
+    last_number = _extract_last_number(tail)
+    if last_number is not None:
+        return last_number
+
+    return math_postprocess_v2(text)
+
+
 @ICL_EVALUATORS.register_module()
 class MATHEvaluator(BaseEvaluator):
 
