@@ -59,10 +59,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
 
         super().__init__(**kwargs)
-        if processor is not None:
-            # avoid wrong loss under gradient accumulation
-            # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
-            self.model_accepts_loss_kwargs = False
+        # Our text models expose `**kwargs` in forward for attention internals, but they do not
+        # consume `num_items_in_batch`. Force the trainer to apply gradient-accumulation scaling
+        # itself so the reported loss stays on the same scale as the component metrics.
+        self.model_accepts_loss_kwargs = False
 
         self.finetuning_args = finetuning_args
         if gen_kwargs is not None:
@@ -131,7 +131,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if (
             config is None
             or not getattr(config, "gap_enable", False)
-            or getattr(config, "gap_training_mode", None) != "puma"
+            or getattr(config, "gap_training_mode", None) not in {"puma", "remask"}
             or not getattr(config, "gap_puma_streaming", True)
             or not hasattr(raw_model, "set_puma_streaming_context")
         ):

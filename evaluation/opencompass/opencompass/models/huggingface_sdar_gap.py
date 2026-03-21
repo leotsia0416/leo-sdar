@@ -32,6 +32,7 @@ def block_diffusion_gap_generate(
     remasking_strategy='low_confidence_dynamic',
     confidence_threshold=1.0,
     remask_threshold=0.5,
+    remask_start_ratio=0.0,
     stopping_criteria_idx=None,
     trace_inputs=None,
 ):
@@ -64,6 +65,7 @@ def block_diffusion_gap_generate(
     finished = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
     remask_steps_per_batch = [0 for _ in range(batch_size)]
     remask_tokens_per_batch = [0 for _ in range(batch_size)]
+    generation_blocks = max(num_blocks - prefill_blocks, 1)
 
     for num_block in range(prefill_blocks, num_blocks):
         block_slice = slice(num_block * block_length, (num_block + 1) * block_length)
@@ -72,6 +74,9 @@ def block_diffusion_gap_generate(
             :, :, block_slice, : (num_block + 1) * block_length
         ]
         cur_position_ids = position_ids[:, block_slice]
+        generated_blocks = (num_block - prefill_blocks) + 1
+        remask_progress = generated_blocks / generation_blocks
+        remask_active = gap_enabled and remask_progress >= remask_start_ratio
 
         for step in range(denoising_steps + 1):
             mask_index = cur_x.eq(mask_id)
@@ -93,7 +98,7 @@ def block_diffusion_gap_generate(
                 past_key_values=past_key_values,
                 use_cache=True,
                 store_kv=False,
-                output_hidden_states=gap_enabled,
+                output_hidden_states=remask_active,
             )
             logits = outputs.logits
             logits[..., mask_id] = float('-inf')
@@ -132,7 +137,7 @@ def block_diffusion_gap_generate(
                 else:
                     raise ValueError(f'Unknown remasking strategy: {remasking_strategy}')
 
-            if gap_enabled:
+            if remask_active:
                 hidden_states = outputs.hidden_states[-1]
                 remask_probs = torch.sigmoid(model.gap_remask_head(hidden_states).squeeze(-1))
                 remask_index = transfer_index & remask_probs.ge(remask_threshold)
@@ -177,6 +182,7 @@ def block_diffusion_gap_generate(
                     'steps_with_remask': remask_steps_per_batch[row_idx],
                     'total_remasked_tokens': remask_tokens_per_batch[row_idx],
                     'gap_enabled': gap_enabled,
+                    'remask_start_ratio': remask_start_ratio,
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
@@ -266,6 +272,7 @@ class SDARGapwithChatTemplate(BD3withChatTemplate):
             remask_threshold=generation_kwargs.get(
                 'remask_threshold', getattr(self.model.config, 'gap_remask_threshold', 0.5)
             ),
+            remask_start_ratio=generation_kwargs.get('remask_start_ratio', 0.0),
             stopping_criteria_idx=stopping_criteria_idx,
             trace_inputs=inputs,
         )[:, tokens['input_ids'].shape[1] :]

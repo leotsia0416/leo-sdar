@@ -1214,7 +1214,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             "num_tokens": num_tokens,
         }
 
-    def prepare_for_puma_streaming_training(self, inputs_ids, labels, position_ids):
+    def prepare_for_puma_streaming_training(self, inputs_ids, labels, position_ids, use_remask_aux: bool = False):
         batch_size = inputs_ids.shape[0]
         rollout_steps = int(getattr(self.config, "gap_rollout_steps", self.config.block_size))
         rollout_steps = max(1, rollout_steps)
@@ -1285,6 +1285,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             "target_scope_mask": target_scope_mask,
             "loss_target_count": target_scope_mask.sum().clamp_min(1),
             "gap_training_mode": "puma",
+            "use_remask_aux": use_remask_aux,
             "rollout_depth": current_stages.float(),
             "next_transfer_tokens": transfer_schedule[current_stages.clamp_max(rollout_steps - 1)],
             "rollout_strategy": getattr(self.config, "gap_rollout_strategy", "low_confidence_dynamic"),
@@ -1346,8 +1347,17 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         num_tokens = calculate_token_nums(position_ids)
         answer_mask = ~prompt_mask
         gap_training_mode = getattr(self.config, "gap_training_mode", "remask")
-        if gap_training_mode == "puma" and getattr(self.config, "gap_puma_streaming", True):
-            return self.prepare_for_puma_streaming_training(inputs_ids, labels, position_ids)
+        if gap_training_mode not in {"puma", "remask"}:
+            raise ValueError(f"Unsupported GAP training mode: {gap_training_mode}")
+
+        use_remask_aux = gap_training_mode == "remask"
+        if getattr(self.config, "gap_puma_streaming", True):
+            return self.prepare_for_puma_streaming_training(
+                inputs_ids,
+                labels,
+                position_ids,
+                use_remask_aux=use_remask_aux,
+            )
 
         noisy_inputs_ids = torch.where(
             answer_mask,
@@ -1361,7 +1371,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         rollout_depth = int(torch.randint(0, rollout_steps, (1,), device=inputs_ids.device).item())
         rollout_strategy = getattr(self.config, "gap_rollout_strategy", "low_confidence_dynamic")
         rollout_confidence_threshold = float(getattr(self.config, "gap_rollout_confidence_threshold", 0.95))
-        default_rollout_scope = "all" if gap_training_mode == "puma" else "frontier_block"
+        default_rollout_scope = "all"
         rollout_scope = getattr(self.config, "gap_rollout_scope", default_rollout_scope)
         completed_steps = 0
 
@@ -1417,18 +1427,8 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             completed_steps += 1
 
         remaining_masked = noisy_inputs_ids.eq(self.config.mask_token_id) & answer_mask
-        if gap_training_mode == "puma":
-            target_scope_mask = labels.ne(-100)
-            logits_to_keep_half = remaining_masked
-        else:
-            target_scope_mask = build_rollout_scope_mask(
-                masked_indices=remaining_masked,
-                reference_mask=labels.ne(-100),
-                num_tokens=num_tokens,
-                block_size=self.config.block_size,
-                scope=rollout_scope,
-            )
-            logits_to_keep_half = remaining_masked & target_scope_mask
+        target_scope_mask = labels.ne(-100)
+        logits_to_keep_half = remaining_masked
         if not logits_to_keep_half.any() and answer_mask.any():
             fallback_mask = target_scope_mask if target_scope_mask.any() else labels.ne(-100)
             if not fallback_mask.any():
@@ -1442,7 +1442,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             labels=labels,
             num_tokens=num_tokens,
             target_scope_mask=target_scope_mask,
-            per_block=(gap_training_mode == "puma"),
+            per_block=True,
             block_size=self.config.block_size,
         )
         concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, _ = self.build_bd_training_inputs(
@@ -1464,7 +1464,8 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             "num_tokens": num_tokens,
             "target_scope_mask": target_scope_mask,
             "loss_target_count": target_scope_mask.sum().clamp_min(1),
-            "gap_training_mode": gap_training_mode,
+            "gap_training_mode": "puma",
+            "use_remask_aux": use_remask_aux,
             "rollout_depth": completed_steps,
             "next_transfer_tokens": int(transfer_schedule[min(completed_steps, rollout_steps - 1)]),
             "rollout_strategy": rollout_strategy,
@@ -1568,7 +1569,10 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                     p_mask=training_batch["p_mask"],
                 )
                 diffusion_loss = diffusion_obj / answer_len.to(diffusion_obj.dtype)
-                if "streaming_slot_indices" in training_batch:
+                use_remask_aux = bool(training_batch.get("use_remask_aux", False))
+                proposal_scores_full = None
+                proposal_ids = None
+                if "streaming_slot_indices" in training_batch or use_remask_aux:
                     proposal_logits = self.lm_head(hidden_states).float()
                     proposal_ids = proposal_logits.argmax(dim=-1)
                     proposal_scores = (
@@ -1582,128 +1586,55 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                         device=proposal_scores.device,
                     )
                     proposal_scores_full[training_batch["logits_to_keep_half"]] = proposal_scores
+                if "streaming_slot_indices" in training_batch:
                     self.advance_puma_streaming_state(training_batch, proposal_scores_full)
                 loss = diffusion_loss
-                streaming_refills_metric = training_batch.get("streaming_refills", 0)
-                if torch.is_tensor(streaming_refills_metric):
-                    streaming_refills_metric = streaming_refills_metric.detach().to(torch.float32)
-                else:
-                    streaming_refills_metric = hidden_states.new_tensor(float(streaming_refills_metric))
-                self._last_loss_metrics = {
-                    "rollout_depth": rollout_depth_metric,
-                    "streaming_refills": streaming_refills_metric,
-                }
-            elif getattr(self.config, "gap_enable", False):
-                proposal_logits = self.lm_head(hidden_states).float()
-                proposal_ids = proposal_logits.argmax(dim=-1)
-                proposal_scores = (
-                    proposal_logits.gather(-1, proposal_ids.unsqueeze(-1)).squeeze(-1)
-                    - torch.logsumexp(proposal_logits, dim=-1)
-                ).exp()
-                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
-                preproj_frontier_loss = loss_fct(
-                    x=hidden_states,
-                    target=train_labels[training_batch["logits_to_keep_half"]].contiguous(),
-                    weight=self.lm_head.weight,
-                    bias=self.lm_head.bias,
-                    p_mask=training_batch["p_mask"],
-                )
-                preproj_diffusion_loss = preproj_frontier_loss / training_batch["loss_target_count"].to(preproj_frontier_loss.dtype)
-                proposal_scores_full = torch.full(
-                    training_batch["noisy_inputs_ids"].shape,
-                    float("-inf"),
-                    dtype=proposal_scores.dtype,
-                    device=proposal_scores.device,
-                )
-                proposal_scores_full[training_batch["logits_to_keep_half"]] = proposal_scores
-                remask_candidate_mask = select_policy_transfer_tokens(
-                    masked_indices=training_batch["logits_to_keep_half"],
-                    proposal_scores_full=proposal_scores_full,
-                    num_tokens=training_batch["num_tokens"],
-                    block_size=self.config.block_size,
-                    num_transfer_tokens=training_batch["next_transfer_tokens"],
-                    strategy=training_batch["rollout_strategy"],
-                    confidence_threshold=training_batch["rollout_confidence_threshold"],
-                    scope=getattr(self.config, "gap_remask_scope", "frontier_block"),
-                )
-                remask_logits = self.gap_remask_head(hidden_states).squeeze(-1)
-                gap_outputs = apply_gap_remask(
-                    noisy_input_ids=training_batch["noisy_inputs_ids"],
-                    clean_input_ids=train_input_ids,
-                    labels=train_labels,
-                    masked_indices=training_batch["logits_to_keep_half"],
-                    p_mask=training_batch["p_mask"],
-                    proposal_ids=proposal_ids,
-                    remask_logits=remask_logits,
-                    candidate_mask_full=remask_candidate_mask,
-                    mask_token_id=self.config.mask_token_id,
-                    remask_threshold=getattr(self.config, "gap_remask_threshold", 0.5),
-                    remask_loss_weight=getattr(self.config, "gap_remask_loss_weight", 1.0),
-                    remask_default_p_mask=getattr(self.config, "gap_remask_default_p_mask", 1.0),
-                    target_scope_mask=training_batch["target_scope_mask"],
-                )
-                global_target_scope_mask = train_labels.ne(-100) & ~training_batch["target_scope_mask"]
-                global_projected_mask = gap_outputs.z_proj.eq(self.config.mask_token_id) & global_target_scope_mask
-                global_p_mask = None
-                if global_projected_mask.any():
-                    global_p_mask = build_rollout_p_mask(
-                        masked_indices=global_projected_mask,
-                        labels=train_labels,
+                loss_metrics = {"rollout_depth": rollout_depth_metric}
+                streaming_refills_metric = training_batch.get("streaming_refills")
+                if streaming_refills_metric is not None:
+                    if torch.is_tensor(streaming_refills_metric):
+                        streaming_refills_metric = streaming_refills_metric.detach().to(torch.float32)
+                    else:
+                        streaming_refills_metric = hidden_states.new_tensor(float(streaming_refills_metric))
+                    loss_metrics["streaming_refills"] = streaming_refills_metric
+                if use_remask_aux:
+                    remask_candidate_mask = select_policy_transfer_tokens(
+                        masked_indices=training_batch["logits_to_keep_half"],
+                        proposal_scores_full=proposal_scores_full,
                         num_tokens=training_batch["num_tokens"],
-                        target_scope_mask=global_target_scope_mask,
+                        block_size=self.config.block_size,
+                        num_transfer_tokens=training_batch["next_transfer_tokens"],
+                        strategy=training_batch["rollout_strategy"],
+                        confidence_threshold=training_batch["rollout_confidence_threshold"],
+                        scope=getattr(self.config, "gap_remask_scope", "frontier_block"),
                     )
-                proj_loss_mask = gap_outputs.projected_mask | global_projected_mask
-                proj_concat_inputs_ids, proj_concat_position_ids, proj_flex_attention_mask_3d, proj_logits_to_keep_half, proj_logits_to_keep, _ = self.build_bd_training_inputs(
-                    inputs_ids=train_input_ids,
-                    noisy_inputs_ids=gap_outputs.z_proj,
-                    position_ids=train_position_ids,
-                    logits_to_keep_half=proj_loss_mask,
-                    num_tokens=training_batch["num_tokens"],
-                )
-                proj_outputs = self.model(
-                    input_ids=proj_concat_inputs_ids,
-                    attention_mask=proj_flex_attention_mask_3d,
-                    position_ids=proj_concat_position_ids,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=True,
-                    cache_position=cache_position,
-                    **kwargs,
-                )
-                proj_hidden_states = proj_outputs.last_hidden_state[proj_logits_to_keep].contiguous()
-                proj_targets = train_labels[proj_logits_to_keep_half].contiguous()
-                frontier_mask_flat = gap_outputs.projected_mask[proj_logits_to_keep_half]
-                frontier_loss = loss_fct(
-                    x=proj_hidden_states[frontier_mask_flat].contiguous(),
-                    target=proj_targets[frontier_mask_flat].contiguous(),
-                    weight=self.lm_head.weight,
-                    bias=self.lm_head.bias,
-                    p_mask=gap_outputs.projected_p_mask,
-                )
-                diffusion_loss = frontier_loss / training_batch["loss_target_count"].to(frontier_loss.dtype)
-                global_loss = diffusion_loss.new_zeros(())
-                global_loss_weight = float(getattr(self.config, "gap_global_loss_weight", 0.0))
-                if global_loss_weight > 0.0 and global_projected_mask.any():
-                    global_mask_flat = global_projected_mask[proj_logits_to_keep_half]
-                    global_target_count = global_target_scope_mask.sum().clamp_min(1)
-                    global_loss = loss_fct(
-                        x=proj_hidden_states[global_mask_flat].contiguous(),
-                        target=proj_targets[global_mask_flat].contiguous(),
-                        weight=self.lm_head.weight,
-                        bias=self.lm_head.bias,
-                        p_mask=global_p_mask,
+                    remask_logits = self.gap_remask_head(hidden_states).squeeze(-1)
+                    gap_outputs = apply_gap_remask(
+                        noisy_input_ids=training_batch["noisy_inputs_ids"],
+                        clean_input_ids=train_input_ids,
+                        labels=train_labels,
+                        masked_indices=training_batch["logits_to_keep_half"],
+                        p_mask=training_batch["p_mask"],
+                        proposal_ids=proposal_ids,
+                        remask_logits=remask_logits,
+                        candidate_mask_full=remask_candidate_mask,
+                        mask_token_id=self.config.mask_token_id,
+                        remask_threshold=getattr(self.config, "gap_remask_threshold", 0.5),
+                        remask_loss_weight=getattr(self.config, "gap_remask_loss_weight", 1.0),
+                        remask_default_p_mask=getattr(self.config, "gap_remask_default_p_mask", 1.0),
+                        target_scope_mask=training_batch["target_scope_mask"],
                     )
-                    global_loss = global_loss / global_target_count.to(global_loss.dtype)
-                remask_loss = gap_outputs.remask_loss
-                loss = diffusion_loss + remask_loss + (global_loss_weight * global_loss)
-                remask_metrics = {
-                    "diffusion_loss": diffusion_loss.detach(),
-                    "remask_loss": remask_loss.detach(),
-                    "rollout_depth": rollout_depth_metric,
-                }
-                if global_loss_weight > 0.0:
-                    remask_metrics["global_loss"] = global_loss.detach()
-                self._last_loss_metrics = remask_metrics
+                    remask_loss = gap_outputs.remask_loss
+                    loss = loss + remask_loss
+                    loss_metrics["diffusion_loss"] = diffusion_loss.detach()
+                    loss_metrics["remask_loss"] = remask_loss.detach()
+                    for metric_name, metric_value in gap_outputs.metrics.items():
+                        if metric_name == "remask_loss":
+                            continue
+                        loss_metrics[metric_name] = hidden_states.new_tensor(float(metric_value))
+                self._last_loss_metrics = loss_metrics
+            elif getattr(self.config, "gap_enable", False):
+                raise ValueError(f'Unsupported GAP training batch mode: {training_batch.get("gap_training_mode")}')
             else:
                 loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
                 loss = loss_fct(  # it will return (sum_loss, unreduced_loss)

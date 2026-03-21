@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
-#SBATCH --time=3:00:00
+#SBATCH --time=12:00:00
 #SBATCH -o /work/leotsia0416/projects/SDAR/logs/test_gap_%j.out
 #SBATCH -e /work/leotsia0416/projects/SDAR/logs/test_gap_%j.err
 #SBATCH --mail-type=END,FAIL
@@ -34,7 +34,208 @@ export PYTHONNOUSERSITE=1
 cd "${REPO_ROOT}/evaluation/opencompass"
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-DEFAULT_MODEL_PATH="${REPO_ROOT}/checkpoint/training_140274/checkpoint-450"  # change this to your checkpoint path
+resolve_latest_training_root() {
+  if [[ ! -d "${REPO_ROOT}/checkpoint" ]]; then
+    return 0
+  fi
+  find "${REPO_ROOT}/checkpoint" -mindepth 1 -maxdepth 1 -type d -name 'training_*' | sort -V | tail -n 1
+}
+
+resolve_latest_checkpoint_dir() {
+  local checkpoint_root="${1:-}"
+  if [[ -z "${checkpoint_root}" || ! -d "${checkpoint_root}" ]]; then
+    return 0
+  fi
+  find "${checkpoint_root}" -mindepth 1 -maxdepth 1 -type d -name 'checkpoint-*' | sort -V | tail -n 1
+}
+
+DEFAULT_CHECKPOINT_ROOT="$(resolve_latest_training_root)"
+DEFAULT_MODEL_PATH="$(resolve_latest_checkpoint_dir "${DEFAULT_CHECKPOINT_ROOT}")"
+if [[ -z "${DEFAULT_MODEL_PATH}" ]]; then
+  DEFAULT_MODEL_PATH="${REPO_ROOT}/Models/SDAR-1.7B-Chat"
+fi
+DEFAULT_SINGLE_WORK_DIR="./outputs/eval-chat-sdar-gap"
+DEFAULT_BLOCK_LENGTH="${SDAR_BLOCK_LENGTH:-4}"
+DEFAULT_CONFIDENCE_THRESHOLD="${SDAR_CONFIDENCE_THRESHOLD:-0.95}"
+DEFAULT_REMASK_THRESHOLD="${SDAR_REMASK_THRESHOLD:-0.5}"
+DEFAULT_REMASK_START_RATIO="${SDAR_REMASK_START_RATIO:-0.5}"
+DEFAULT_TEMPERATURE="${SDAR_TEMPERATURE:-0.0}"
+
+list_checkpoint_dirs() {
+  local checkpoint_root="$1"
+  local checkpoint_order="${2:-desc}"
+  local -a checkpoint_dirs=()
+  local -a ordered_dirs=()
+  local idx=0
+
+  if [[ ! -d "${checkpoint_root}" ]]; then
+    echo "Checkpoint root does not exist: ${checkpoint_root}" >&2
+    return 1
+  fi
+
+  mapfile -t checkpoint_dirs < <(find "${checkpoint_root}" -mindepth 1 -maxdepth 1 -type d -name 'checkpoint-*' | sort -V)
+  if [[ "${#checkpoint_dirs[@]}" -eq 0 ]]; then
+    echo "No checkpoint-* directories found under ${checkpoint_root}" >&2
+    return 1
+  fi
+
+  case "${checkpoint_order,,}" in
+    desc|reverse|backward)
+      for (( idx=${#checkpoint_dirs[@]}-1; idx>=0; idx-- )); do
+        ordered_dirs+=("${checkpoint_dirs[$idx]}")
+      done
+      ;;
+    asc|forward)
+      ordered_dirs=("${checkpoint_dirs[@]}")
+      ;;
+    *)
+      echo "Unsupported SDAR_CHECKPOINT_ORDER: ${checkpoint_order}" >&2
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "${ordered_dirs[@]}"
+}
+
+format_threshold() {
+  local value="${1:?missing threshold value}"
+  printf '%.2f' "${value}" | tr '.' '_'
+}
+
+resolve_work_dir_abs() {
+  local work_dir="${1:?missing work dir}"
+  case "${work_dir}" in
+    /*) printf '%s\n' "${work_dir}" ;;
+    *) printf '%s\n' "$(pwd)/${work_dir#./}" ;;
+  esac
+}
+
+default_all_work_dir() {
+  local checkpoint_root="${1:?missing checkpoint root}"
+  printf './outputs/eval-gap-%s-all-ckpts\n' "$(basename "${checkpoint_root}")"
+}
+
+build_model_abbr() {
+  local model_name="${1:?missing model name}"
+  printf '%s-gap-b%s-thr%s-rt%s-t%s-rs%s\n' \
+    "${model_name}" \
+    "${DEFAULT_BLOCK_LENGTH}" \
+    "$(format_threshold "${DEFAULT_CONFIDENCE_THRESHOLD}")" \
+    "$(format_threshold "${DEFAULT_REMASK_THRESHOLD}")" \
+    "$(format_threshold "${DEFAULT_TEMPERATURE}")" \
+    "$(format_threshold "${DEFAULT_REMASK_START_RATIO}")"
+}
+
+find_existing_result() {
+  local checkpoint_path="${1:?missing checkpoint path}"
+  local work_dir_base_abs="${2:?missing work dir base}"
+  local checkpoint_root="${3:?missing checkpoint root}"
+  local model_name=""
+  local model_abbr=""
+  local legacy_work_dir_abs=""
+  local search_root=""
+  local existing_result=""
+  local -a search_roots=()
+
+  model_name="$(basename "${checkpoint_path}")"
+  model_abbr="$(build_model_abbr "${model_name}")"
+  legacy_work_dir_abs="$(resolve_work_dir_abs "${DEFAULT_SINGLE_WORK_DIR}")"
+  search_roots+=("${work_dir_base_abs}")
+  if [[ "${legacy_work_dir_abs}" != "${work_dir_base_abs}" ]]; then
+    search_roots+=("${legacy_work_dir_abs}")
+  fi
+
+  for search_root in "${search_roots[@]}"; do
+    if [[ ! -d "${search_root}" ]]; then
+      continue
+    fi
+    existing_result="$(find "${search_root}" -type f -path "*/results/${model_abbr}/gsm8k.json" -print -quit 2>/dev/null || true)"
+    if [[ -n "${existing_result}" ]]; then
+      printf '%s\n' "${existing_result}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+run_all_checkpoints() {
+  local requested_root="${SDAR_CHECKPOINT_ROOT:-${DEFAULT_CHECKPOINT_ROOT:-${SDAR_MODEL_PATH:-${DEFAULT_MODEL_PATH}}}}"
+  local checkpoint_root="${requested_root}"
+  local checkpoint_order="${SDAR_CHECKPOINT_ORDER:-desc}"
+  local checkpoint_limit="${SDAR_CHECKPOINT_LIMIT:-}"
+  local work_dir_base=""
+  local work_dir_base_abs=""
+  local script_path
+  local -a checkpoint_dirs=()
+  local dispatched=0
+  local skipped=0
+  local checkpoint_path=""
+  local model_root=""
+  local model_name=""
+  local child_work_dir=""
+  local total_checkpoints=0
+  local existing_result=""
+
+  if [[ "${checkpoint_root##*/}" == checkpoint-* ]]; then
+    checkpoint_root="$(dirname "${checkpoint_root}")"
+  fi
+  checkpoint_root="$(realpath "${checkpoint_root}")"
+  script_path="$(realpath "$0")"
+
+  if [[ -n "${checkpoint_limit}" && ! "${checkpoint_limit}" =~ ^[0-9]+$ ]]; then
+    echo "SDAR_CHECKPOINT_LIMIT must be an integer, got: ${checkpoint_limit}" >&2
+    return 1
+  fi
+
+  mapfile -t checkpoint_dirs < <(list_checkpoint_dirs "${checkpoint_root}" "${checkpoint_order}")
+  if [[ "${#checkpoint_dirs[@]}" -eq 0 ]]; then
+    echo "No checkpoints to run under ${checkpoint_root}" >&2
+    return 1
+  fi
+  total_checkpoints="${#checkpoint_dirs[@]}"
+  work_dir_base="${SDAR_WORK_DIR:-$(default_all_work_dir "${checkpoint_root}")}"
+  work_dir_base_abs="$(resolve_work_dir_abs "${work_dir_base}")"
+
+  echo "Running ${total_checkpoints} checkpoints sequentially from ${checkpoint_root} (${checkpoint_order})" >&2
+  echo "Batch work dir base: ${work_dir_base_abs}" >&2
+  for checkpoint_path in "${checkpoint_dirs[@]}"; do
+    if [[ -n "${checkpoint_limit}" && "${dispatched}" -ge "${checkpoint_limit}" ]]; then
+      break
+    fi
+
+    model_root="$(dirname "${checkpoint_path}")"
+    model_name="$(basename "${checkpoint_path}")"
+    child_work_dir="${work_dir_base%/}/$(basename "${checkpoint_root}")/${model_name}"
+    existing_result="$(find_existing_result "${checkpoint_path}" "${work_dir_base_abs}" "${checkpoint_root}" || true)"
+    if [[ -n "${existing_result}" ]]; then
+      skipped=$((skipped + 1))
+      echo "[skip ${skipped}] ${model_name} already has results at ${existing_result}" >&2
+      continue
+    fi
+    echo "[$((dispatched + 1))/${total_checkpoints}] ${model_name} -> ${child_work_dir}" >&2
+    SDAR_EVAL_ALL_CHECKPOINTS=false \
+      SDAR_MODEL_PATH="${checkpoint_path}" \
+      SDAR_MODEL_ROOT="${model_root}" \
+      SDAR_MODEL_NAME="${model_name}" \
+      SDAR_WORK_DIR="${child_work_dir}" \
+      bash "${script_path}"
+    dispatched=$((dispatched + 1))
+  done
+
+  echo "Completed ${dispatched} checkpoint evals. Skipped ${skipped} completed checkpoints." >&2
+}
+
+DEFAULT_RUN_ALL_CHECKPOINTS="false"
+if [[ -z "${SDAR_EVAL_ALL_CHECKPOINTS:-}" && -z "${SDAR_MODEL_PATH:-}" && -n "${DEFAULT_CHECKPOINT_ROOT:-}" ]]; then
+  DEFAULT_RUN_ALL_CHECKPOINTS="true"
+fi
+RUN_ALL_CHECKPOINTS="$(normalize_bool "${SDAR_EVAL_ALL_CHECKPOINTS:-${DEFAULT_RUN_ALL_CHECKPOINTS}}")"
+if [[ "${RUN_ALL_CHECKPOINTS}" == "true" ]]; then
+  run_all_checkpoints
+  exit 0
+fi
+
 if [[ -n "${SDAR_MODEL_PATH:-}" ]]; then
   if [[ ! -d "${SDAR_MODEL_PATH}" ]]; then
     echo "SDAR_MODEL_PATH does not exist: ${SDAR_MODEL_PATH}" >&2
@@ -56,14 +257,15 @@ if [[ ! -d "${SDAR_MODEL_PATH}" ]]; then
 fi
 
 export SDAR_EVAL_GPUS="${SDAR_EVAL_GPUS:-1}"
-export SDAR_INFER_BATCH_SIZE="${SDAR_INFER_BATCH_SIZE:-16}"
+export SDAR_INFER_BATCH_SIZE="${SDAR_INFER_BATCH_SIZE:-32}"
 export SDAR_CONFIDENCE_THRESHOLD="${SDAR_CONFIDENCE_THRESHOLD:-0.95}"
 export SDAR_REMASK_THRESHOLD="${SDAR_REMASK_THRESHOLD:-0.5}"
+export SDAR_REMASK_START_RATIO="${SDAR_REMASK_START_RATIO:-0.5}"
 export SDAR_BLOCK_LENGTH="${SDAR_BLOCK_LENGTH:-4}"
 export SDAR_MAX_NEW_TOKENS="${SDAR_MAX_NEW_TOKENS:-1024}"
-export SDAR_TEMPERATURE="${SDAR_TEMPERATURE:-1.0}"
+export SDAR_TEMPERATURE="${SDAR_TEMPERATURE:-0.0}"
 export SDAR_TORCH_DTYPE="${SDAR_TORCH_DTYPE:-bfloat16}"
-export SDAR_WORK_DIR="${SDAR_WORK_DIR:-./outputs/eval-chat-sdar-gap}"
+export SDAR_WORK_DIR="${SDAR_WORK_DIR:-${DEFAULT_SINGLE_WORK_DIR}}"
 
 export HF_HOME="${SDAR_MODEL_ROOT}/hf"
 export HF_HUB_CACHE="${HF_HOME}/hub"

@@ -2,7 +2,7 @@ from opencompass.datasets import (
     GSM8KDataset,
     MATHEvaluator,
     gsm8k_dataset_postprocess,
-    math_postprocess_v2,
+    math_postprocess_sdar,
 )
 from opencompass.models import SDARGapwithChatTemplate
 from opencompass.openicl.icl_inferencer import GenInferencer
@@ -40,10 +40,11 @@ INFER_BATCH_SIZE = int(_os.environ.get('SDAR_INFER_BATCH_SIZE', '1'))
 BLOCK_LENGTH = int(_os.environ.get('SDAR_BLOCK_LENGTH', '4'))
 CONFIDENCE_THRESHOLD = float(_os.environ.get('SDAR_CONFIDENCE_THRESHOLD', '0.95'))
 REMASK_THRESHOLD = float(_os.environ.get('SDAR_REMASK_THRESHOLD', '0.5'))
+REMASK_START_RATIO = float(_os.environ.get('SDAR_REMASK_START_RATIO', '0.5'))
 MAX_NEW_TOKENS = int(_os.environ.get('SDAR_MAX_NEW_TOKENS', '1024'))
 TOP_P = float(_os.environ.get('SDAR_TOP_P', '1.0'))
 TOP_K = int(_os.environ.get('SDAR_TOP_K', '1'))
-TEMPERATURE = float(_os.environ.get('SDAR_TEMPERATURE', '1.0'))
+TEMPERATURE = float(_os.environ.get('SDAR_TEMPERATURE', '0.0'))
 TORCH_DTYPE = _os.environ.get('SDAR_TORCH_DTYPE', 'bfloat16')
 TEST_RANGE = _os.environ.get('SDAR_TEST_RANGE')
 
@@ -55,6 +56,8 @@ if not _os.path.exists(MODEL_PATH):
 
 if INFER_BATCH_SIZE < 1:
     raise ValueError('SDAR_INFER_BATCH_SIZE must be a positive integer.')
+if not 0.0 <= REMASK_START_RATIO <= 1.0:
+    raise ValueError('SDAR_REMASK_START_RATIO must be within [0.0, 1.0].')
 
 torch_dtype = {
     'float16': 'torch.float16',
@@ -78,9 +81,13 @@ gsm8k_datasets = [
                         dict(
                             role='HUMAN',
                             prompt=(
-                                '{question}\nPlease reason step by step, '
-                                'and put your final answer within '
-                                '\\boxed{}.'
+                                '{question}\nReason step by step, but keep the '
+                                'reasoning concise. End your response with '
+                                'exactly one final line in the form '
+                                '\\boxed{NUMBER}. Put only the final numeric '
+                                'answer inside the box, with no words or '
+                                'units. Do not output anything after the '
+                                'boxed answer.'
                             ),
                         ),
                     ],
@@ -91,7 +98,7 @@ gsm8k_datasets = [
         ),
         eval_cfg=dict(
             evaluator=dict(type=MATHEvaluator, version='v2'),
-            pred_postprocessor=dict(type=math_postprocess_v2),
+            pred_postprocessor=dict(type=math_postprocess_sdar),
             dataset_postprocessor=dict(type=gsm8k_dataset_postprocess),
         ),
     )
@@ -106,6 +113,8 @@ for dataset in datasets:
 model_abbr = (
     f'{MODEL_NAME}-gap-b{BLOCK_LENGTH}-thr{_format_threshold(CONFIDENCE_THRESHOLD)}'
     f'-rt{_format_threshold(REMASK_THRESHOLD)}'
+    f'-t{_format_threshold(TEMPERATURE)}'
+    f'-rs{_format_threshold(REMASK_START_RATIO)}'
 )
 
 models = [
@@ -127,6 +136,7 @@ models = [
             else 'low_confidence_static',
             confidence_threshold=CONFIDENCE_THRESHOLD,
             remask_threshold=REMASK_THRESHOLD,
+            remask_start_ratio=REMASK_START_RATIO,
         ),
         model_kwargs=dict(
             torch_dtype=torch_dtype,
