@@ -117,6 +117,25 @@ def patch_config(
         "gap_global_loss_weight": model_args.gap_global_loss_weight,
         "gap_remask_default_p_mask": model_args.gap_remask_default_p_mask,
         "gap_remask_scope": model_args.gap_remask_scope,
+        "gap_loss_scope": model_args.gap_loss_scope,
+        "gap_noisy_context_loss_weight": model_args.gap_noisy_context_loss_weight,
+        "gap_projected_aux_loss_weight": model_args.gap_projected_aux_loss_weight,
+        "gap_remask_stage_mode": model_args.gap_remask_stage_mode,
+        "gap_remask_supervision": model_args.gap_remask_supervision,
+        "gap_remask_adv_warmup_ratio": model_args.gap_remask_adv_warmup_ratio,
+        "gap_remask_adv_max_candidates": model_args.gap_remask_adv_max_candidates,
+        "gap_curriculum_enable": model_args.gap_curriculum_enable,
+        "gap_curriculum_warmup_ratio": model_args.gap_curriculum_warmup_ratio,
+        "gap_curriculum_min_coupling": model_args.gap_curriculum_min_coupling,
+        "gap_grpo_loss_weight": model_args.gap_grpo_loss_weight,
+        "gap_grpo_num_samples": model_args.gap_grpo_num_samples,
+        "gap_grpo_clip_eps": model_args.gap_grpo_clip_eps,
+        "gap_grpo_entropy_coef": model_args.gap_grpo_entropy_coef,
+        "gap_grpo_remask_penalty": model_args.gap_grpo_remask_penalty,
+        "gap_grpo_advantage_eps": model_args.gap_grpo_advantage_eps,
+        "gap_grpo_sample_prob_eps": model_args.gap_grpo_sample_prob_eps,
+        "gap_grpo_dense_reward_weight": model_args.gap_grpo_dense_reward_weight,
+        "gap_grpo_terminal_reward_weight": model_args.gap_grpo_terminal_reward_weight,
     }
     for attr_name, attr_value in gap_optional_args.items():
         if attr_value is not None:
@@ -193,6 +212,12 @@ def patch_model(
 
     if add_valuehead:
         prepare_valuehead_model(model)
+
+    setattr(model, "_gap_reward_tokenizer", tokenizer)
+    setattr(model, "_grpo_tokenizer", tokenizer)
+    if hasattr(model, "model"):
+        setattr(model.model, "_gap_reward_tokenizer", tokenizer)
+        setattr(model.model, "_grpo_tokenizer", tokenizer)
 
     if model_args.resize_vocab:
         resize_embedding_layer(model, tokenizer)

@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -A MST114566
 #SBATCH -J SDAR_train
-#SBATCH -p normal,normal2
+#SBATCH -p normal2
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=12
 #SBATCH --time=24:00:00
 #SBATCH -o /work/leotsia0416/projects/SDAR/logs/train_%j.out
@@ -59,9 +59,10 @@ normalize_bool() {
 
 TRAIN_HEAD_ONLY="$(normalize_bool "${TRAIN_HEAD_ONLY:-false}")"
 HEAD_ONLY_TRAINABLE_MODULES="${HEAD_ONLY_TRAINABLE_MODULES:-gap_remask_head}"
-TRAIN_PROFILE="${TRAIN_PROFILE:-format_align_mix}"
-DEFAULT_TRAIN_DATASET="open_r1_math,gsm8k_train_local"
-BASE_MODEL_PATH="${REPO_ROOT}/Models/SDAR-1.7B-Chat"
+TRAIN_PROFILE="${TRAIN_PROFILE:-hard_math}"
+HARD_MATH_DATASET_NAME="${HARD_MATH_DATASET_NAME:-math_train_hard_local}"
+DEFAULT_TRAIN_DATASET="${HARD_MATH_DATASET_NAME}"
+BASE_MODEL_PATH="${REPO_ROOT}/Models/SDAR-1.7B-Chat-"
 DEFAULT_TRAIN_CHECKPOINT_PATH="/work/leotsia0416/projects/SDAR/checkpoint/training_141209/checkpoint-666"
 ORCA_MATH_DATASET_NAME="${ORCA_MATH_DATASET_NAME:-orca_math_200k_local}"
 FORMAT_ALIGN_DATASET_NAME="${FORMAT_ALIGN_DATASET_NAME:-gsm8k_boxed_format_align}"
@@ -83,8 +84,8 @@ TRAIN_RUN_NAME_BASE="${TRAIN_RUN_NAME_BASE:-}"
 DEFAULT_TRAIN_MIX_STRATEGY="concat"
 TRAIN_MIX_STRATEGY="${TRAIN_MIX_STRATEGY:-${DEFAULT_TRAIN_MIX_STRATEGY}}"
 TRAIN_INTERLEAVE_PROBS="${TRAIN_INTERLEAVE_PROBS:-}"
+TRAIN_NEAT_PACKING="${TRAIN_NEAT_PACKING:-$(yaml_get neat_packing)}"
 TRAIN_GAP_TRAINING_MODE="${TRAIN_GAP_TRAINING_MODE:-$(yaml_get gap_training_mode)}"
-TRAIN_GAP_PUMA_STREAMING="${TRAIN_GAP_PUMA_STREAMING:-$(yaml_get gap_puma_streaming)}"
 TRAIN_GAP_ROLLOUT_STEPS="${TRAIN_GAP_ROLLOUT_STEPS:-$(yaml_get gap_rollout_steps)}"
 TRAIN_GAP_ROLLOUT_STRATEGY="${TRAIN_GAP_ROLLOUT_STRATEGY:-$(yaml_get gap_rollout_strategy)}"
 TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD="${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD:-$(yaml_get gap_rollout_confidence_threshold)}"
@@ -95,7 +96,21 @@ TRAIN_GAP_REMASK_THRESHOLD="${TRAIN_GAP_REMASK_THRESHOLD:-$(yaml_get gap_remask_
 TRAIN_GAP_REMASK_LOSS_WEIGHT="${TRAIN_GAP_REMASK_LOSS_WEIGHT:-$(yaml_get gap_remask_loss_weight)}"
 TRAIN_GAP_GLOBAL_LOSS_WEIGHT="${TRAIN_GAP_GLOBAL_LOSS_WEIGHT:-$(yaml_get gap_global_loss_weight)}"
 TRAIN_GAP_REMASK_DEFAULT_P_MASK="${TRAIN_GAP_REMASK_DEFAULT_P_MASK:-$(yaml_get gap_remask_default_p_mask)}"
-TRAIN_REMASK_SCOPE="${TRAIN_REMASK_SCOPE:-$(yaml_get gap_remask_scope)}"
+TRAIN_GAP_GRPO_LOSS_WEIGHT="${TRAIN_GAP_GRPO_LOSS_WEIGHT:-$(yaml_get gap_grpo_loss_weight)}"
+TRAIN_GAP_GRPO_NUM_SAMPLES="${TRAIN_GAP_GRPO_NUM_SAMPLES:-$(yaml_get gap_grpo_num_samples)}"
+TRAIN_GAP_GRPO_CLIP_EPS="${TRAIN_GAP_GRPO_CLIP_EPS:-$(yaml_get gap_grpo_clip_eps)}"
+TRAIN_GAP_GRPO_ENTROPY_COEF="${TRAIN_GAP_GRPO_ENTROPY_COEF:-$(yaml_get gap_grpo_entropy_coef)}"
+TRAIN_GAP_GRPO_REMASK_PENALTY="${TRAIN_GAP_GRPO_REMASK_PENALTY:-$(yaml_get gap_grpo_remask_penalty)}"
+TRAIN_GAP_GRPO_ADVANTAGE_EPS="${TRAIN_GAP_GRPO_ADVANTAGE_EPS:-$(yaml_get gap_grpo_advantage_eps)}"
+TRAIN_GAP_GRPO_SAMPLE_PROB_EPS="${TRAIN_GAP_GRPO_SAMPLE_PROB_EPS:-$(yaml_get gap_grpo_sample_prob_eps)}"
+TRAIN_GAP_GRPO_DENSE_REWARD_WEIGHT="${TRAIN_GAP_GRPO_DENSE_REWARD_WEIGHT:-$(yaml_get gap_grpo_dense_reward_weight)}"
+TRAIN_GAP_GRPO_TERMINAL_REWARD_WEIGHT="${TRAIN_GAP_GRPO_TERMINAL_REWARD_WEIGHT:-$(yaml_get gap_grpo_terminal_reward_weight)}"
+TRAIN_DISABLE_GRADIENT_CHECKPOINTING="${TRAIN_DISABLE_GRADIENT_CHECKPOINTING:-$(yaml_get disable_gradient_checkpointing)}"
+TRAIN_GRADIENT_CHECKPOINTING="${TRAIN_GRADIENT_CHECKPOINTING:-$(yaml_get gradient_checkpointing)}"
+TRAIN_USE_REENTRANT_GC="${TRAIN_USE_REENTRANT_GC:-$(yaml_get use_reentrant_gc)}"
+TRAIN_GRADIENT_CHECKPOINTING_KWARGS="${TRAIN_GRADIENT_CHECKPOINTING_KWARGS:-$(yaml_get gradient_checkpointing_kwargs)}"
+TRAIN_PER_DEVICE_TRAIN_BATCH_SIZE="${TRAIN_PER_DEVICE_TRAIN_BATCH_SIZE:-$(yaml_get per_device_train_batch_size)}"
+TRAIN_GRADIENT_ACCUMULATION_STEPS="${TRAIN_GRADIENT_ACCUMULATION_STEPS:-$(yaml_get gradient_accumulation_steps)}"
 TRAIN_ROLLOUT_SCOPE="${TRAIN_ROLLOUT_SCOPE:-frontier_block}"
 TRAIN_REMASK_SCOPE="${TRAIN_REMASK_SCOPE:-frontier_block}"
 
@@ -103,7 +118,17 @@ if [[ -n "${TRAIN_CHECKPOINT_PATH}" ]]; then
     TRAIN_MODEL_PATH="${TRAIN_MODEL_PATH:-${TRAIN_CHECKPOINT_PATH}}"
 fi
 
-if [[ "${TRAIN_PROFILE}" == "format_align" ]]; then
+if [[ "${TRAIN_PROFILE}" == "hard_math" ]]; then
+    if [[ "${TRAIN_DATASET}" == "${DEFAULT_TRAIN_DATASET}" ]]; then
+        TRAIN_DATASET="${HARD_MATH_DATASET_NAME}"
+    fi
+    TRAIN_MIX_STRATEGY="${DEFAULT_TRAIN_MIX_STRATEGY}"
+    TRAIN_INTERLEAVE_PROBS=""
+    TRAIN_LEARNING_RATE="${TRAIN_LEARNING_RATE:-5e-6}"
+    TRAIN_MAX_STEPS="${TRAIN_MAX_STEPS:-1000}"
+    TRAIN_CUTOFF_LEN="${TRAIN_CUTOFF_LEN:-2048}"
+    TRAIN_RUN_NAME_BASE="${TRAIN_RUN_NAME_BASE:-sdar_1p7b_hard_math_gap_resume666_genwin3_grpo_single8_nopack_nogc_b2ga16}"
+elif [[ "${TRAIN_PROFILE}" == "format_align" ]]; then
     if [[ "${TRAIN_DATASET}" == "${DEFAULT_TRAIN_DATASET}" ]]; then
         TRAIN_DATASET="${FORMAT_ALIGN_DATASET_NAME}"
     fi
@@ -185,7 +210,11 @@ else
     TOKENIZED_CUTOFF_LEN="$(yaml_get cutoff_len)"
 fi
 TOKENIZED_CUTOFF_LEN="${TOKENIZED_CUTOFF_LEN:-2048}"
-TRAIN_TOKENIZED_PATH="${TRAIN_TOKENIZED_PATH:-${REPO_ROOT}/cache/tokenized_${TRAIN_DATASET_TAG}_cutoff${TOKENIZED_CUTOFF_LEN}_gap_pack}"
+TOKENIZED_LAYOUT_SUFFIX="gap_nopack"
+if [[ "$(normalize_bool "${TRAIN_NEAT_PACKING}")" == "true" ]]; then
+    TOKENIZED_LAYOUT_SUFFIX="gap_pack"
+fi
+TRAIN_TOKENIZED_PATH="${TRAIN_TOKENIZED_PATH:-${REPO_ROOT}/cache/tokenized_${TRAIN_DATASET_TAG}_cutoff${TOKENIZED_CUTOFF_LEN}_${TOKENIZED_LAYOUT_SUFFIX}}"
 
 get_transformers_version() {
     local env_prefix="$1"
@@ -302,7 +331,7 @@ if [[ "${USE_FORMAT_ALIGN_DATASET}" == "true" ]]; then
 fi
 
 sed '/^launcher_[^:]*:/d' "${CONFIG_FILE}" | sed "s/%j/${job_id}/g" > "${TMP_CONFIG_FILE}"
-python - "${TMP_CONFIG_FILE}" "${SAVE_STEPS}" "${TRAIN_HEAD_ONLY}" "${HEAD_ONLY_TRAINABLE_MODULES}" "${TRAIN_DATASET}" "${TRAIN_TOKENIZED_PATH}" "${TRAIN_RUN_NAME_BASE}" "${TRAIN_MIX_STRATEGY}" "${TRAIN_INTERLEAVE_PROBS}" "${TRAIN_GAP_TRAINING_MODE}" "${TRAIN_GAP_PUMA_STREAMING}" "${TRAIN_GAP_ROLLOUT_STEPS}" "${TRAIN_GAP_ROLLOUT_STRATEGY}" "${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD}" "${TRAIN_ROLLOUT_SCOPE}" "${TRAIN_GAP_REVEAL_RATIO}" "${TRAIN_GAP_MIN_REVEAL_TOKENS}" "${TRAIN_GAP_REMASK_THRESHOLD}" "${TRAIN_GAP_REMASK_LOSS_WEIGHT}" "${TRAIN_GAP_GLOBAL_LOSS_WEIGHT}" "${TRAIN_GAP_REMASK_DEFAULT_P_MASK}" "${TRAIN_REMASK_SCOPE}" "${TRAIN_MODEL_PATH}" "${TRAIN_RESUME_FROM_CHECKPOINT}" "${TRAIN_LEARNING_RATE}" "${TRAIN_NUM_TRAIN_EPOCHS}" "${TRAIN_MAX_STEPS}" "${TRAIN_CUTOFF_LEN}" "${TRAIN_OVERWRITE_CACHE}" <<'PY'
+python - "${TMP_CONFIG_FILE}" "${SAVE_STEPS}" "${TRAIN_HEAD_ONLY}" "${HEAD_ONLY_TRAINABLE_MODULES}" "${TRAIN_DATASET}" "${TRAIN_TOKENIZED_PATH}" "${TRAIN_RUN_NAME_BASE}" "${TRAIN_MIX_STRATEGY}" "${TRAIN_INTERLEAVE_PROBS}" "${TRAIN_GAP_TRAINING_MODE}" "${TRAIN_GAP_ROLLOUT_STEPS}" "${TRAIN_GAP_ROLLOUT_STRATEGY}" "${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD}" "${TRAIN_ROLLOUT_SCOPE}" "${TRAIN_GAP_REVEAL_RATIO}" "${TRAIN_GAP_MIN_REVEAL_TOKENS}" "${TRAIN_GAP_REMASK_THRESHOLD}" "${TRAIN_GAP_REMASK_LOSS_WEIGHT}" "${TRAIN_GAP_GLOBAL_LOSS_WEIGHT}" "${TRAIN_GAP_REMASK_DEFAULT_P_MASK}" "${TRAIN_GAP_GRPO_LOSS_WEIGHT}" "${TRAIN_GAP_GRPO_NUM_SAMPLES}" "${TRAIN_GAP_GRPO_CLIP_EPS}" "${TRAIN_GAP_GRPO_ENTROPY_COEF}" "${TRAIN_GAP_GRPO_REMASK_PENALTY}" "${TRAIN_GAP_GRPO_ADVANTAGE_EPS}" "${TRAIN_GAP_GRPO_SAMPLE_PROB_EPS}" "${TRAIN_GAP_GRPO_DENSE_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_TERMINAL_REWARD_WEIGHT}" "${TRAIN_DISABLE_GRADIENT_CHECKPOINTING}" "${TRAIN_GRADIENT_CHECKPOINTING}" "${TRAIN_USE_REENTRANT_GC}" "${TRAIN_GRADIENT_CHECKPOINTING_KWARGS}" "${TRAIN_PER_DEVICE_TRAIN_BATCH_SIZE}" "${TRAIN_GRADIENT_ACCUMULATION_STEPS}" "${TRAIN_MODEL_PATH}" "${TRAIN_RESUME_FROM_CHECKPOINT}" "${TRAIN_LEARNING_RATE}" "${TRAIN_NUM_TRAIN_EPOCHS}" "${TRAIN_MAX_STEPS}" "${TRAIN_CUTOFF_LEN}" "${TRAIN_OVERWRITE_CACHE}" <<'PY'
 import pathlib
 import re
 import sys
@@ -317,25 +346,38 @@ train_run_name_base = sys.argv[7]
 train_mix_strategy = sys.argv[8]
 train_interleave_probs = sys.argv[9]
 train_gap_training_mode = sys.argv[10]
-train_gap_puma_streaming = sys.argv[11]
-train_gap_rollout_steps = sys.argv[12]
-train_gap_rollout_strategy = sys.argv[13]
-train_gap_rollout_conf_threshold = sys.argv[14]
-train_rollout_scope = sys.argv[15]
-train_gap_reveal_ratio = sys.argv[16]
-train_gap_min_reveal_tokens = sys.argv[17]
-train_gap_remask_threshold = sys.argv[18]
-train_gap_remask_loss_weight = sys.argv[19]
-train_gap_global_loss_weight = sys.argv[20]
-train_gap_remask_default_p_mask = sys.argv[21]
-train_remask_scope = sys.argv[22]
-train_model_path = sys.argv[23]
-train_resume_from_checkpoint = sys.argv[24]
-train_learning_rate = sys.argv[25]
-train_num_train_epochs = sys.argv[26]
-train_max_steps = sys.argv[27]
-train_cutoff_len = sys.argv[28]
-train_overwrite_cache = sys.argv[29]
+train_gap_rollout_steps = sys.argv[11]
+train_gap_rollout_strategy = sys.argv[12]
+train_gap_rollout_conf_threshold = sys.argv[13]
+train_rollout_scope = sys.argv[14]
+train_gap_reveal_ratio = sys.argv[15]
+train_gap_min_reveal_tokens = sys.argv[16]
+train_gap_remask_threshold = sys.argv[17]
+train_gap_remask_loss_weight = sys.argv[18]
+train_gap_global_loss_weight = sys.argv[19]
+train_gap_remask_default_p_mask = sys.argv[20]
+train_gap_grpo_loss_weight = sys.argv[21]
+train_gap_grpo_num_samples = sys.argv[22]
+train_gap_grpo_clip_eps = sys.argv[23]
+train_gap_grpo_entropy_coef = sys.argv[24]
+train_gap_grpo_remask_penalty = sys.argv[25]
+train_gap_grpo_advantage_eps = sys.argv[26]
+train_gap_grpo_sample_prob_eps = sys.argv[27]
+train_gap_grpo_dense_reward_weight = sys.argv[28]
+train_gap_grpo_terminal_reward_weight = sys.argv[29]
+train_disable_gradient_checkpointing = sys.argv[30]
+train_gradient_checkpointing = sys.argv[31]
+train_use_reentrant_gc = sys.argv[32]
+train_gradient_checkpointing_kwargs = sys.argv[33]
+train_per_device_train_batch_size = sys.argv[34]
+train_gradient_accumulation_steps = sys.argv[35]
+train_model_path = sys.argv[36]
+train_resume_from_checkpoint = sys.argv[37]
+train_learning_rate = sys.argv[38]
+train_num_train_epochs = sys.argv[39]
+train_max_steps = sys.argv[40]
+train_cutoff_len = sys.argv[41]
+train_overwrite_cache = sys.argv[42]
 text = config_path.read_text()
 
 
@@ -360,7 +402,6 @@ updated = set_key(updated, "tokenized_path", train_tokenized_path)
 updated = set_key(updated, "mix_strategy", train_mix_strategy)
 updated = set_key(updated, "interleave_probs", train_interleave_probs if train_interleave_probs else "null")
 updated = set_key(updated, "gap_training_mode", train_gap_training_mode)
-updated = set_key(updated, "gap_puma_streaming", train_gap_puma_streaming)
 updated = set_key(updated, "gap_rollout_steps", train_gap_rollout_steps)
 updated = set_key(updated, "gap_rollout_strategy", train_gap_rollout_strategy)
 updated = set_key(updated, "gap_rollout_confidence_threshold", train_gap_rollout_conf_threshold)
@@ -371,7 +412,21 @@ updated = set_key(updated, "gap_remask_threshold", train_gap_remask_threshold)
 updated = set_key(updated, "gap_remask_loss_weight", train_gap_remask_loss_weight)
 updated = set_key(updated, "gap_global_loss_weight", train_gap_global_loss_weight)
 updated = set_key(updated, "gap_remask_default_p_mask", train_gap_remask_default_p_mask)
-updated = set_key(updated, "gap_remask_scope", train_remask_scope)
+updated = set_key(updated, "gap_grpo_loss_weight", train_gap_grpo_loss_weight)
+updated = set_key(updated, "gap_grpo_num_samples", train_gap_grpo_num_samples)
+updated = set_key(updated, "gap_grpo_clip_eps", train_gap_grpo_clip_eps)
+updated = set_key(updated, "gap_grpo_entropy_coef", train_gap_grpo_entropy_coef)
+updated = set_key(updated, "gap_grpo_remask_penalty", train_gap_grpo_remask_penalty)
+updated = set_key(updated, "gap_grpo_advantage_eps", train_gap_grpo_advantage_eps)
+updated = set_key(updated, "gap_grpo_sample_prob_eps", train_gap_grpo_sample_prob_eps)
+updated = set_key(updated, "gap_grpo_dense_reward_weight", train_gap_grpo_dense_reward_weight)
+updated = set_key(updated, "gap_grpo_terminal_reward_weight", train_gap_grpo_terminal_reward_weight)
+updated = set_key(updated, "disable_gradient_checkpointing", train_disable_gradient_checkpointing)
+updated = set_key(updated, "gradient_checkpointing", train_gradient_checkpointing)
+updated = set_key(updated, "use_reentrant_gc", train_use_reentrant_gc)
+updated = set_key(updated, "gradient_checkpointing_kwargs", train_gradient_checkpointing_kwargs)
+updated = set_key(updated, "per_device_train_batch_size", train_per_device_train_batch_size)
+updated = set_key(updated, "gradient_accumulation_steps", train_gradient_accumulation_steps)
 updated = set_key(updated, "resume_from_checkpoint", train_resume_from_checkpoint if train_resume_from_checkpoint else "null")
 
 if train_model_path:
@@ -415,7 +470,6 @@ if [[ -n "${TRAIN_INTERLEAVE_PROBS}" ]]; then
     echo "Interleave probs: ${TRAIN_INTERLEAVE_PROBS}" >&2
 fi
 echo "GAP training mode: ${TRAIN_GAP_TRAINING_MODE}" >&2
-echo "GAP puma streaming: ${TRAIN_GAP_PUMA_STREAMING}" >&2
 echo "GAP rollout steps: ${TRAIN_GAP_ROLLOUT_STEPS}" >&2
 echo "GAP rollout strategy: ${TRAIN_GAP_ROLLOUT_STRATEGY}" >&2
 echo "GAP rollout confidence threshold: ${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD}" >&2
@@ -425,6 +479,19 @@ echo "GAP remask threshold: ${TRAIN_GAP_REMASK_THRESHOLD}" >&2
 echo "GAP remask loss weight: ${TRAIN_GAP_REMASK_LOSS_WEIGHT}" >&2
 echo "GAP global loss weight: ${TRAIN_GAP_GLOBAL_LOSS_WEIGHT}" >&2
 echo "GAP remask default p_mask: ${TRAIN_GAP_REMASK_DEFAULT_P_MASK}" >&2
+echo "GAP GRPO loss weight: ${TRAIN_GAP_GRPO_LOSS_WEIGHT}" >&2
+echo "GAP GRPO num samples: ${TRAIN_GAP_GRPO_NUM_SAMPLES}" >&2
+echo "GAP GRPO clip eps: ${TRAIN_GAP_GRPO_CLIP_EPS}" >&2
+echo "GAP GRPO entropy coef: ${TRAIN_GAP_GRPO_ENTROPY_COEF}" >&2
+echo "GAP GRPO remask penalty: ${TRAIN_GAP_GRPO_REMASK_PENALTY}" >&2
+echo "GAP GRPO dense reward weight: ${TRAIN_GAP_GRPO_DENSE_REWARD_WEIGHT}" >&2
+echo "GAP GRPO terminal reward weight: ${TRAIN_GAP_GRPO_TERMINAL_REWARD_WEIGHT}" >&2
+echo "Disable gradient checkpointing: ${TRAIN_DISABLE_GRADIENT_CHECKPOINTING}" >&2
+echo "Training args gradient checkpointing: ${TRAIN_GRADIENT_CHECKPOINTING}" >&2
+echo "Use reentrant GC: ${TRAIN_USE_REENTRANT_GC}" >&2
+echo "Gradient checkpointing kwargs: ${TRAIN_GRADIENT_CHECKPOINTING_KWARGS}" >&2
+echo "Per-device train batch size: ${TRAIN_PER_DEVICE_TRAIN_BATCH_SIZE}" >&2
+echo "Gradient accumulation steps: ${TRAIN_GRADIENT_ACCUMULATION_STEPS}" >&2
 if [[ -n "${TRAIN_MODEL_PATH}" ]]; then
     echo "Model path override: ${TRAIN_MODEL_PATH}" >&2
 fi

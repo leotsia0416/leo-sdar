@@ -227,6 +227,82 @@ class BaseModelArguments:
         default=None,
         metadata={"help": "Scope of tokens eligible for GAP remask candidate selection during training."},
     )
+    gap_loss_scope: Optional[Literal["all", "frontier_block"]] = field(
+        default=None,
+        metadata={"help": "Legacy scope selector for auxiliary GAP diffusion losses."},
+    )
+    gap_noisy_context_loss_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Legacy auxiliary loss weight on noisy-context GAP targets."},
+    )
+    gap_projected_aux_loss_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Legacy auxiliary loss weight on projected GAP states."},
+    )
+    gap_remask_stage_mode: Optional[str] = field(
+        default=None,
+        metadata={"help": "Legacy GAP remask stage mode flag kept for backward-compatible config parsing."},
+    )
+    gap_remask_supervision: Optional[str] = field(
+        default=None,
+        metadata={"help": "Legacy GAP remask supervision mode kept for backward-compatible config parsing."},
+    )
+    gap_remask_adv_warmup_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Legacy GAP remask advantage warmup ratio kept for backward-compatible config parsing."},
+    )
+    gap_remask_adv_max_candidates: Optional[int] = field(
+        default=None,
+        metadata={"help": "Legacy cap on GAP remask advantage candidates kept for backward-compatible config parsing."},
+    )
+    gap_curriculum_enable: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Legacy GAP curriculum flag kept for backward-compatible config parsing."},
+    )
+    gap_curriculum_warmup_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Legacy GAP curriculum warmup ratio kept for backward-compatible config parsing."},
+    )
+    gap_curriculum_min_coupling: Optional[float] = field(
+        default=None,
+        metadata={"help": "Legacy GAP curriculum minimum coupling kept for backward-compatible config parsing."},
+    )
+    gap_grpo_loss_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Loss weight applied to the GAP remask GRPO objective."},
+    )
+    gap_grpo_num_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of remask action samples drawn per state for GAP GRPO."},
+    )
+    gap_grpo_clip_eps: Optional[float] = field(
+        default=None,
+        metadata={"help": "Clipping epsilon used by the PPO-style GAP GRPO objective."},
+    )
+    gap_grpo_entropy_coef: Optional[float] = field(
+        default=None,
+        metadata={"help": "Entropy regularization coefficient used by the GAP GRPO objective."},
+    )
+    gap_grpo_remask_penalty: Optional[float] = field(
+        default=None,
+        metadata={"help": "Penalty coefficient applied to remask rate inside the GAP GRPO reward."},
+    )
+    gap_grpo_advantage_eps: Optional[float] = field(
+        default=None,
+        metadata={"help": "Numerical stabilizer used when normalizing GAP GRPO rewards into advantages."},
+    )
+    gap_grpo_sample_prob_eps: Optional[float] = field(
+        default=None,
+        metadata={"help": "Probability clamp used before sampling GAP GRPO Bernoulli remask actions."},
+    )
+    gap_grpo_dense_reward_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Weight applied to the dense future-diffusion shaping reward inside GAP GRPO."},
+    )
+    gap_grpo_terminal_reward_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Weight applied to the terminal final-answer correctness reward inside GAP GRPO."},
+    )
 
     def __post_init__(self):
         if self.model_name_or_path is None:
