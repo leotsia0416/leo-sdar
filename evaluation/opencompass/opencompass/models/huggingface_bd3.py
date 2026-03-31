@@ -216,6 +216,36 @@ def get_num_transfer_tokens(block_length, steps):
 
     return num_transfer_tokens
 
+
+def _build_stop_token_sequences(stop_words, tokenizer):
+    stop_sequences = []
+    for stop in stop_words:
+        sequence = tokenizer.encode(stop, add_special_tokens=False)
+        if sequence:
+            stop_sequences.append(sequence)
+    return stop_sequences
+
+
+def _match_stop_sequences(token_ids: torch.LongTensor, stop_sequences) -> torch.BoolTensor:
+    matches = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=token_ids.device)
+    if token_ids.numel() == 0 or not stop_sequences:
+        return matches
+
+    for sequence in stop_sequences:
+        seq_len = len(sequence)
+        if seq_len == 0:
+            continue
+        if seq_len == 1:
+            matches |= token_ids.eq(sequence[0]).any(dim=1)
+            continue
+        if token_ids.shape[1] < seq_len:
+            continue
+        sequence_tensor = token_ids.new_tensor(sequence)
+        windows = token_ids.unfold(1, seq_len, 1)
+        matches |= windows.eq(sequence_tensor).all(dim=-1).any(dim=1)
+
+    return matches
+
 @torch.no_grad()
 def block_diffusion_generate(
     model,
@@ -230,7 +260,7 @@ def block_diffusion_generate(
     top_p=1.0,
     remasking='low_confidence',
     threshold=1.0,
-    stopping_criteria_idx=None):
+    stopping_criteria_sequences=None):
     '''
     Args:
         model: Mask predictor.
@@ -354,10 +384,9 @@ def block_diffusion_generate(
                 cur_x[transfer_index] = x0[transfer_index]
 
         x[:, num_block * block_length: (num_block + 1) * block_length] = cur_x
-        if stopping_criteria_idx is not None:
+        if stopping_criteria_sequences:
             generated_prefix = x[:, prompt_length: (num_block + 1) * block_length]
-            for stop_idx in stopping_criteria_idx:
-                finished |= generated_prefix.eq(stop_idx).any(dim=1)
+            finished |= _match_stop_sequences(generated_prefix, stopping_criteria_sequences)
             end_generate = bool(finished.all().item())
         if end_generate:
             break
@@ -854,7 +883,7 @@ class BD3withChatTemplate(BaseModel):
         if min_out_len is not None:
             generation_kwargs['min_new_tokens'] = min_out_len
         generation_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
-        stopping_criteria_idx = [self.tokenizer.encode(stop, add_special_tokens=False)[0] for stop in stopping_criteria]
+        stopping_criteria_sequences = _build_stop_token_sequences(stopping_criteria, self.tokenizer)
         outputs = block_diffusion_generate(
             self.model,
             self.tokenizer,
@@ -869,7 +898,7 @@ class BD3withChatTemplate(BaseModel):
             # cfg_scale=generation_kwargs['cfg_scale'],
             remasking=generation_kwargs['remasking'],
             threshold=generation_kwargs['threshold'],
-            stopping_criteria_idx=stopping_criteria_idx,
+            stopping_criteria_sequences=stopping_criteria_sequences,
             )[:, tokens["input_ids"].shape[1]:]
 
         decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)

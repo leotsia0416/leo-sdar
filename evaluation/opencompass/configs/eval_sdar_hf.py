@@ -1,25 +1,94 @@
 from opencompass.datasets import (
     GSM8KDataset,
-    IFEvalDataset,
-    IFEvaluator,
     MATHEvaluator,
     gsm8k_dataset_postprocess,
-    math_postprocess_v2,
+    math_postprocess_sdar,
 )
+from opencompass.models import BD3withChatTemplate
 from opencompass.openicl.icl_inferencer import GenInferencer
 from opencompass.openicl.icl_prompt_template import PromptTemplate
 from opencompass.openicl.icl_retriever import ZeroRetriever
-from opencompass.runners import LocalRunner
 from opencompass.partitioners import NaivePartitioner, NumWorkerPartitioner
-from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
-from opencompass.models import BD3withChatTemplate
+from opencompass.runners import LocalRunner
+from opencompass.tasks import OpenICLEvalTask, OpenICLInferTask
 
+_os = __import__('os')
+_pathlib = __import__('pathlib')
+
+
+def _default_num_workers() -> int:
+    visible_devices = _os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+    if visible_devices:
+        return max(1, len([x for x in visible_devices.split(',') if x.strip()]))
+    return 1
+
+
+def _format_threshold(threshold: float) -> str:
+    return f'{threshold:.2f}'.replace('.', '_')
+
+
+def _has_model_weights(model_path: str) -> bool:
+    if _os.path.exists(_os.path.join(model_path, 'model.safetensors')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'model.safetensors.index.json')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'pytorch_model.bin')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'pytorch_model.bin.index.json')):
+        return True
+    return any(_pathlib.Path(model_path).glob('model-*.safetensors'))
+
+
+REPO_ROOT = str(_pathlib.Path(__file__).resolve().parents[3])
+MODEL_ROOT = _os.path.abspath(
+    _os.environ.get('SDAR_MODEL_ROOT', _os.path.join(REPO_ROOT, 'Models'))
+)
+MODEL_NAME = _os.environ.get('SDAR_MODEL_NAME', 'SDAR-1.7B-Chat-')
+MODEL_PATH = _os.path.abspath(
+    _os.environ.get('SDAR_MODEL_PATH', _os.path.join(MODEL_ROOT, MODEL_NAME))
+)
+GSM8K_PATH = _os.path.abspath(
+    _os.environ.get('SDAR_GSM8K_PATH', '/work/leotsia0416/datasets/gsm8k')
+)
+GSM8K_ABBR = _os.environ.get('SDAR_GSM8K_ABBR', 'gsm8k')
+NUM_WORKERS = int(_os.environ.get('SDAR_EVAL_GPUS', _default_num_workers()))
+INFER_BATCH_SIZE = int(_os.environ.get('SDAR_INFER_BATCH_SIZE', '1'))
+BLOCK_LENGTH = int(_os.environ.get('SDAR_BLOCK_LENGTH', '4'))
+CONFIDENCE_THRESHOLD = float(_os.environ.get('SDAR_CONFIDENCE_THRESHOLD', '1.0'))
+MAX_NEW_TOKENS = int(_os.environ.get('SDAR_MAX_NEW_TOKENS', '1024'))
+TOP_P = float(_os.environ.get('SDAR_TOP_P', '1.0'))
+TOP_K = int(_os.environ.get('SDAR_TOP_K', '1'))
+TEMPERATURE = float(_os.environ.get('SDAR_TEMPERATURE', '0.0'))
+TORCH_DTYPE = _os.environ.get('SDAR_TORCH_DTYPE', 'bfloat16')
+TEST_RANGE = _os.environ.get('SDAR_TEST_RANGE')
+
+if not _os.path.isdir(MODEL_PATH):
+    raise FileNotFoundError(
+        f'SDAR model path does not exist: {MODEL_PATH}. '
+        'Set SDAR_MODEL_ROOT or SDAR_MODEL_NAME before running OpenCompass.'
+    )
+if not _os.path.exists(_os.path.join(MODEL_PATH, 'config.json')):
+    raise FileNotFoundError(f'SDAR model path is missing config.json: {MODEL_PATH}.')
+if not _has_model_weights(MODEL_PATH):
+    raise FileNotFoundError(f'SDAR model path is missing model weights: {MODEL_PATH}.')
+if not _os.path.isdir(GSM8K_PATH):
+    raise FileNotFoundError(f'SDAR GSM8K path does not exist: {GSM8K_PATH}.')
+if not _os.path.exists(_os.path.join(GSM8K_PATH, 'test.jsonl')):
+    raise FileNotFoundError(f'SDAR GSM8K path is missing test.jsonl: {GSM8K_PATH}.')
+
+torch_dtype = {
+    'float16': 'torch.float16',
+    'bfloat16': 'torch.bfloat16',
+    'float32': 'torch.float',
+}.get(TORCH_DTYPE)
+if torch_dtype is None:
+    raise ValueError("SDAR_TORCH_DTYPE must be one of: float16, bfloat16, float32.")
 
 gsm8k_datasets = [
     dict(
-        abbr='gsm8k',
+        abbr=GSM8K_ABBR,
         type=GSM8KDataset,
-        path='opencompass/gsm8k',
+        path=GSM8K_PATH,
         reader_cfg=dict(input_columns=['question'], output_column='answer'),
         infer_cfg=dict(
             prompt_template=dict(
@@ -29,114 +98,96 @@ gsm8k_datasets = [
                         dict(
                             role='HUMAN',
                             prompt=(
-                                '{question}\nPlease reason step by step, and '
-                                'put your final answer within \\boxed{}.'
+                                '{question}\nReason step by step, but keep the '
+                                'reasoning concise. End your response with '
+                                'exactly one final line in the form '
+                                '\\boxed{NUMBER}. Put only the final numeric '
+                                'answer inside the box, with no words or '
+                                'units. Do not output anything after the '
+                                'boxed answer.'
                             ),
                         ),
                     ],
                 ),
             ),
             retriever=dict(type=ZeroRetriever),
-            inferencer=dict(type=GenInferencer),
+            inferencer=dict(type=GenInferencer, max_out_len=MAX_NEW_TOKENS),
         ),
         eval_cfg=dict(
             evaluator=dict(type=MATHEvaluator, version='v2'),
-            pred_postprocessor=dict(type=math_postprocess_v2),
+            pred_postprocessor=dict(type=math_postprocess_sdar),
             dataset_postprocessor=dict(type=gsm8k_dataset_postprocess),
         ),
     )
 ]
 
-ifeval_datasets = [
+datasets = [*gsm8k_datasets]
+for dataset in datasets:
+    dataset['infer_cfg']['inferencer']['batch_size'] = INFER_BATCH_SIZE
+    if TEST_RANGE:
+        dataset['reader_cfg']['test_range'] = TEST_RANGE
+
+model_abbr = (
+    f'{MODEL_NAME}-b{BLOCK_LENGTH}-thr{_format_threshold(CONFIDENCE_THRESHOLD)}'
+)
+
+models = [
     dict(
-        abbr='IFEval',
-        type=IFEvalDataset,
-        path='data/ifeval/input_data.jsonl',
-        reader_cfg=dict(input_columns=['prompt'], output_column='reference'),
-        infer_cfg=dict(
-            prompt_template=dict(
-                type=PromptTemplate,
-                template=dict(round=[dict(role='HUMAN', prompt='{prompt}')]),
-            ),
-            retriever=dict(type=ZeroRetriever),
-            inferencer=dict(type=GenInferencer),
+        type=BD3withChatTemplate,
+        abbr=model_abbr,
+        path=MODEL_PATH,
+        run_cfg=dict(num_gpus=1),
+        generation_kwargs=dict(
+            mask_id=151669,
+            gen_length=MAX_NEW_TOKENS,
+            block_length=BLOCK_LENGTH,
+            denoising_steps=BLOCK_LENGTH,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            top_p=TOP_P,
+            cfg_scale=0.0,
+            remasking='low_confidence',
+            threshold=CONFIDENCE_THRESHOLD,
         ),
-        eval_cfg=dict(
-            evaluator=dict(type=IFEvaluator),
-            pred_role='BOT',
+        model_kwargs=dict(
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            device_map='cuda',
         ),
     )
 ]
 
-# Summarizer
 summarizer = dict(
-    dataset_abbrs=[['gsm8k', 'accuracy']],
+    dataset_abbrs=[[GSM8K_ABBR, 'accuracy']],
     summary_groups=[],
 )
 
-# datasets = [*mmlu_datasets, *gsm8k_datasets, *humaneval_datasets, *sanitized_mbpp_datasets, *math_datasets, *mathbench_datasets, *ifeval_datasets]
-datasets = [*gsm8k_datasets]
-for dataset in datasets:
-    dataset['infer_cfg']['inferencer']['batch_size'] = 1 # only support batchsize=1 up to now
-
-# model
-model_configs = [
-    # ("SDAR-1.7B-Chat-b4-thr0_95", "/xxx/Models/SDAR/SDAR-1.7B-Chat", 4, 0.95, 1),
-    ("SDAR-1.7B-Chat-b4-thr1_00", "/work/tom900908/SDAR/Models/SDAR-1.7B-Chat", 4, 1.0, 1),
-    # ("SDAR-4B-Chat-b4-thr0_95", "/xxx/Models/SDAR/SDAR-4B-Chat", 4, 0.95, 1),
-    # ("SDAR-4B-Chat-b4-thr1_00", "/xxx/Models/SDAR/SDAR-4B-Chat", 4, 1.0, 1),
-    # ("SDAR-8B-Chat-b4-thr0_95", "/xxx/Models/SDAR/SDAR-8B-Chat", 4, 0.95, 1),
-    # ("SDAR-8B-Chat-b4-thr1_00", "/xxx/Models/SDAR/SDAR-8B-Chat", 4, 1.0, 1),
-    # ("SDAR-30B-A3B-Chat-b4-thr0_95", "/xxx/Models/SDAR/SDAR-30B-A3B-Chat", 4, 0.95, 1),
-    # ("SDAR-30B-A3B-Chat-b4-thr1_00", "/xxx/Models/SDAR/SDAR-30B-A3B-Chat", 4, 1.0, 1)
-]
-models = []
-for abbr, path, block_length, threshold, num_gpus in model_configs:
-
-    models.append(
-        dict(
-        type=BD3withChatTemplate,
-        abbr=abbr,
-        path=path,
-        run_cfg=dict(num_gpus=num_gpus),
-        generation_kwargs=dict(
-            mask_id=151669,
-            gen_length=4096,
-            block_length=block_length,
-            denoising_steps=block_length,
-            temperature=1.0,
-            top_k=1,
-            top_p=1.0,
-            cfg_scale=0.0,
-            remasking='low_confidence',
-            threshold=threshold
-        ),
-        model_kwargs=dict(
-            torch_dtype='torch.float16',
-            trust_remote_code=True,
-        ),
-    )
-    )
-
-GPUS = 2
 infer = dict(
-    # 同时启动num_workers个任务并行
     partitioner=dict(
         type=NumWorkerPartitioner,
-        num_worker=GPUS,  # 划分完成后的任务数 / 预期能有的 worker 数
-        # force_rebuild=True
+        num_worker=NUM_WORKERS,
     ),
     runner=dict(
         type=LocalRunner,
-        max_num_workers=GPUS,  # 最大并行运行进程数
+        max_num_workers=NUM_WORKERS,
         keep_tmp_file=True,
         task=dict(type=OpenICLInferTask),
-        retry=5
-    )
-)
-eval = dict(
-    partitioner=dict(type=NaivePartitioner, n=16),
-    runner=dict(type=LocalRunner, task=dict(type=OpenICLEvalTask, dump_details=True)),
+        retry=5,
+    ),
 )
 
-work_dir = f'./outputs/eval-chat-sdar'
+eval = dict(
+    partitioner=dict(type=NaivePartitioner, n=1),
+    runner=dict(
+        type=LocalRunner,
+        task=dict(type=OpenICLEvalTask, dump_details=True),
+    ),
+)
+
+work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar')
+
+del _default_num_workers
+del _format_threshold
+del _has_model_weights
+del _os
+del _pathlib

@@ -31,13 +31,31 @@ def _format_threshold(threshold: float) -> str:
     return f'{threshold:.2f}'.replace('.', '_')
 
 
+def _has_model_weights(model_path: str) -> bool:
+    if _os.path.exists(_os.path.join(model_path, 'model.safetensors')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'model.safetensors.index.json')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'pytorch_model.bin')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'pytorch_model.bin.index.json')):
+        return True
+    return any(_pathlib.Path(model_path).glob('model-*.safetensors'))
+
+
 REPO_ROOT = _pathlib.Path(__file__).resolve().parents[3]
 REPO_ROOT = str(REPO_ROOT)
 MODEL_ROOT = _os.path.abspath(
     _os.environ.get('SDAR_MODEL_ROOT', _os.path.join(REPO_ROOT, 'Models'))
 )
-MODEL_NAME = _os.environ.get('SDAR_MODEL_NAME', 'SDAR-1.7B-Chat')
-MODEL_PATH = _os.path.abspath(_os.path.join(MODEL_ROOT, MODEL_NAME))
+MODEL_NAME = _os.environ.get('SDAR_MODEL_NAME', 'SDAR-1.7B-Chat-')
+MODEL_PATH = _os.path.abspath(
+    _os.environ.get('SDAR_MODEL_PATH', _os.path.join(MODEL_ROOT, MODEL_NAME))
+)
+GSM8K_PATH = _os.path.abspath(
+    _os.environ.get('SDAR_GSM8K_PATH', '/work/leotsia0416/datasets/gsm8k')
+)
+GSM8K_ABBR = _os.environ.get('SDAR_GSM8K_ABBR', 'gsm8k')
 EVAL_SCOPE = _os.environ.get('SDAR_EVAL_SCOPE', 'gsm8k').lower()
 NUM_WORKERS = int(_os.environ.get('SDAR_EVAL_GPUS', _default_num_workers()))
 INFER_BATCH_SIZE = int(_os.environ.get('SDAR_INFER_BATCH_SIZE', '1'))
@@ -49,11 +67,19 @@ TOP_P = float(_os.environ.get('SDAR_TOP_P', '0.95'))
 TOP_K = int(_os.environ.get('SDAR_TOP_K', '50'))
 TEMPERATURE = float(_os.environ.get('SDAR_TEMPERATURE', '1.0'))
 
-if not _os.path.exists(MODEL_PATH):
+if not _os.path.isdir(MODEL_PATH):
     raise FileNotFoundError(
         f'SDAR model path does not exist: {MODEL_PATH}. '
         'Set SDAR_MODEL_ROOT or SDAR_MODEL_NAME before running OpenCompass.'
     )
+if not _os.path.exists(_os.path.join(MODEL_PATH, 'config.json')):
+    raise FileNotFoundError(f'SDAR model path is missing config.json: {MODEL_PATH}.')
+if not _has_model_weights(MODEL_PATH):
+    raise FileNotFoundError(f'SDAR model path is missing model weights: {MODEL_PATH}.')
+if not _os.path.isdir(GSM8K_PATH):
+    raise FileNotFoundError(f'SDAR GSM8K path does not exist: {GSM8K_PATH}.')
+if not _os.path.exists(_os.path.join(GSM8K_PATH, 'test.jsonl')):
+    raise FileNotFoundError(f'SDAR GSM8K path is missing test.jsonl: {GSM8K_PATH}.')
 
 if not (0 < CONFIDENCE_THRESHOLD <= 1.0):
     raise ValueError('SDAR_CONFIDENCE_THRESHOLD must be in the range (0, 1].')
@@ -90,9 +116,9 @@ if EVAL_SCOPE == 'full':
 else:
     gsm8k_datasets = [
         dict(
-            abbr='gsm8k',
+            abbr=GSM8K_ABBR,
             type=GSM8KDataset,
-            path='opencompass/gsm8k',
+            path=GSM8K_PATH,
             reader_cfg=dict(input_columns=['question'], output_column='answer'),
             infer_cfg=dict(
                 prompt_template=dict(
@@ -199,7 +225,7 @@ full_summarizer = dict(
 )
 
 gsm8k_summarizer = dict(
-    dataset_abbrs=[['gsm8k', 'accuracy']],
+    dataset_abbrs=[[GSM8K_ABBR, 'accuracy']],
     summary_groups=[],
 )
 
@@ -220,6 +246,9 @@ else:
 
 for dataset in datasets:
     dataset['infer_cfg']['inferencer']['batch_size'] = INFER_BATCH_SIZE
+    test_range = _os.environ.get('SDAR_TEST_RANGE')
+    if test_range:
+        dataset['reader_cfg']['test_range'] = test_range
 
 dllm_unmasking_strategy = (
     'low_confidence_dynamic'
@@ -280,5 +309,6 @@ work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar')
 
 del _default_num_workers
 del _format_threshold
+del _has_model_weights
 del _os
 del _pathlib

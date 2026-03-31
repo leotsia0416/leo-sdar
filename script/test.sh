@@ -13,13 +13,41 @@
 
 set -euo pipefail
 
+has_model_weights() {
+  local model_dir="${1:?missing model dir}"
+  [[ -e "${model_dir}/model.safetensors" ]] && return 0
+  [[ -e "${model_dir}/model.safetensors.index.json" ]] && return 0
+  [[ -e "${model_dir}/pytorch_model.bin" ]] && return 0
+  [[ -e "${model_dir}/pytorch_model.bin.index.json" ]] && return 0
+  compgen -G "${model_dir}/model-*.safetensors" > /dev/null && return 0
+  return 1
+}
+
+validate_hf_model_dir() {
+  local model_dir="${1:?missing model dir}"
+  if [[ ! -d "${model_dir}" ]]; then
+    echo "Resolved model path does not exist: ${model_dir}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${model_dir}/config.json" ]]; then
+    echo "Resolved model path is missing config.json: ${model_dir}" >&2
+    exit 1
+  fi
+  if ! has_model_weights "${model_dir}"; then
+    echo "Resolved model path is missing model weights: ${model_dir}" >&2
+    exit 1
+  fi
+}
+
 export PATH="/work/leotsia0416/sdar_eval/bin:${PATH}"
 export PYTHONNOUSERSITE=1
 cd /work/leotsia0416/projects/SDAR/evaluation/opencompass
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-export SDAR_MODEL_ROOT="/work/leotsia0416/projects/SDAR/Models"
-export SDAR_MODEL_NAME="SDAR-1.7B-Chat"
+export SDAR_MODEL_PATH="/work/leotsia0416/projects/SDAR/Models/SDAR-1.7B-Chat-"
+validate_hf_model_dir "${SDAR_MODEL_PATH}"
+export SDAR_MODEL_ROOT="$(dirname "${SDAR_MODEL_PATH}")"
+export SDAR_MODEL_NAME="$(basename "${SDAR_MODEL_PATH}")"
 export SDAR_EVAL_SCOPE="gsm8k"
 export SDAR_EVAL_GPUS="2"
 export SDAR_INFER_BATCH_SIZE="1"

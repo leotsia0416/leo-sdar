@@ -115,6 +115,7 @@ def patch_config(
         "gap_remask_threshold": model_args.gap_remask_threshold,
         "gap_remask_loss_weight": model_args.gap_remask_loss_weight,
         "gap_global_loss_weight": model_args.gap_global_loss_weight,
+        "gap_diffusion_loss_weight": model_args.gap_diffusion_loss_weight,
         "gap_remask_default_p_mask": model_args.gap_remask_default_p_mask,
         "gap_remask_scope": model_args.gap_remask_scope,
         "gap_loss_scope": model_args.gap_loss_scope,
@@ -136,6 +137,7 @@ def patch_config(
         "gap_grpo_sample_prob_eps": model_args.gap_grpo_sample_prob_eps,
         "gap_grpo_dense_reward_weight": model_args.gap_grpo_dense_reward_weight,
         "gap_grpo_terminal_reward_weight": model_args.gap_grpo_terminal_reward_weight,
+        "gap_grpo_format_reward_weight": model_args.gap_grpo_format_reward_weight,
     }
     for attr_name, attr_value in gap_optional_args.items():
         if attr_value is not None:

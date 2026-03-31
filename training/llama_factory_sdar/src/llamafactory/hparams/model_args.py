@@ -219,6 +219,10 @@ class BaseModelArguments:
         default=None,
         metadata={"help": "Auxiliary diffusion loss weight applied to masked targets outside the frontier scope."},
     )
+    gap_diffusion_loss_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Global weight applied to the main GAP diffusion cross-entropy loss."},
+    )
     gap_remask_default_p_mask: Optional[float] = field(
         default=None,
         metadata={"help": "Fallback p_mask assigned to projected GAP remask tokens."},
@@ -302,6 +306,10 @@ class BaseModelArguments:
     gap_grpo_terminal_reward_weight: Optional[float] = field(
         default=None,
         metadata={"help": "Weight applied to the terminal final-answer correctness reward inside GAP GRPO."},
+    )
+    gap_grpo_format_reward_weight: Optional[float] = field(
+        default=None,
+        metadata={"help": "Weight applied to the terminal output-format reward inside GAP GRPO."},
     )
 
     def __post_init__(self):

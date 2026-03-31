@@ -27,32 +27,58 @@ def _format_threshold(threshold: float) -> str:
     return f'{threshold:.2f}'.replace('.', '_')
 
 
+def _has_model_weights(model_path: str) -> bool:
+    if _os.path.exists(_os.path.join(model_path, 'model.safetensors')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'model.safetensors.index.json')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'pytorch_model.bin')):
+        return True
+    if _os.path.exists(_os.path.join(model_path, 'pytorch_model.bin.index.json')):
+        return True
+    return any(_pathlib.Path(model_path).glob('model-*.safetensors'))
+
+
 REPO_ROOT = str(_pathlib.Path(__file__).resolve().parents[3])
 MODEL_ROOT = _os.path.abspath(
     _os.environ.get('SDAR_MODEL_ROOT', _os.path.join(REPO_ROOT, 'Models'))
 )
-MODEL_NAME = _os.environ.get('SDAR_MODEL_NAME', 'SDAR-1.7B-Chat')
+MODEL_NAME = _os.environ.get('SDAR_MODEL_NAME', 'SDAR-1.7B-Chat-')
 MODEL_PATH = _os.path.abspath(
     _os.environ.get('SDAR_MODEL_PATH', _os.path.join(MODEL_ROOT, MODEL_NAME))
 )
+GSM8K_PATH = _os.path.abspath(
+    _os.environ.get('SDAR_GSM8K_PATH', '/work/leotsia0416/datasets/gsm8k')
+)
+GSM8K_ABBR = _os.environ.get('SDAR_GSM8K_ABBR', 'gsm8k')
 NUM_WORKERS = int(_os.environ.get('SDAR_EVAL_GPUS', _default_num_workers()))
 INFER_BATCH_SIZE = int(_os.environ.get('SDAR_INFER_BATCH_SIZE', '1'))
 BLOCK_LENGTH = int(_os.environ.get('SDAR_BLOCK_LENGTH', '4'))
 CONFIDENCE_THRESHOLD = float(_os.environ.get('SDAR_CONFIDENCE_THRESHOLD', '0.95'))
-REMASK_THRESHOLD = float(_os.environ.get('SDAR_REMASK_THRESHOLD', '0.5'))
+REMASK_THRESHOLD = float(_os.environ.get('SDAR_REMASK_THRESHOLD', '0.15'))
 REMASK_START_RATIO = float(_os.environ.get('SDAR_REMASK_START_RATIO', '0.5'))
-MAX_NEW_TOKENS = int(_os.environ.get('SDAR_MAX_NEW_TOKENS', '1024'))
+REMASK_INTERVAL_BLOCKS = int(_os.environ.get('SDAR_REMASK_INTERVAL_BLOCKS', '2'))
+REMASK_WINDOW_BLOCKS = int(_os.environ.get('SDAR_REMASK_WINDOW_BLOCKS', '3'))
+MAX_NEW_TOKENS = int(_os.environ.get('SDAR_MAX_NEW_TOKENS', '1536'))
 TOP_P = float(_os.environ.get('SDAR_TOP_P', '1.0'))
 TOP_K = int(_os.environ.get('SDAR_TOP_K', '1'))
 TEMPERATURE = float(_os.environ.get('SDAR_TEMPERATURE', '0.0'))
 TORCH_DTYPE = _os.environ.get('SDAR_TORCH_DTYPE', 'bfloat16')
 TEST_RANGE = _os.environ.get('SDAR_TEST_RANGE')
 
-if not _os.path.exists(MODEL_PATH):
+if not _os.path.isdir(MODEL_PATH):
     raise FileNotFoundError(
         f'SDAR model path does not exist: {MODEL_PATH}. '
         'Set SDAR_MODEL_ROOT or SDAR_MODEL_NAME before running OpenCompass.'
     )
+if not _os.path.exists(_os.path.join(MODEL_PATH, 'config.json')):
+    raise FileNotFoundError(f'SDAR model path is missing config.json: {MODEL_PATH}.')
+if not _has_model_weights(MODEL_PATH):
+    raise FileNotFoundError(f'SDAR model path is missing model weights: {MODEL_PATH}.')
+if not _os.path.isdir(GSM8K_PATH):
+    raise FileNotFoundError(f'SDAR GSM8K path does not exist: {GSM8K_PATH}.')
+if not _os.path.exists(_os.path.join(GSM8K_PATH, 'test.jsonl')):
+    raise FileNotFoundError(f'SDAR GSM8K path is missing test.jsonl: {GSM8K_PATH}.')
 
 if INFER_BATCH_SIZE < 1:
     raise ValueError('SDAR_INFER_BATCH_SIZE must be a positive integer.')
@@ -69,9 +95,9 @@ if torch_dtype is None:
 
 gsm8k_datasets = [
     dict(
-        abbr='gsm8k',
+        abbr=GSM8K_ABBR,
         type=GSM8KDataset,
-        path='opencompass/gsm8k',
+        path=GSM8K_PATH,
         reader_cfg=dict(input_columns=['question'], output_column='answer'),
         infer_cfg=dict(
             prompt_template=dict(
@@ -81,13 +107,13 @@ gsm8k_datasets = [
                         dict(
                             role='HUMAN',
                             prompt=(
-                                '{question}\nReason step by step, but keep the '
-                                'reasoning concise. End your response with '
-                                'exactly one final line in the form '
-                                '\\boxed{NUMBER}. Put only the final numeric '
-                                'answer inside the box, with no words or '
-                                'units. Do not output anything after the '
-                                'boxed answer.'
+                                '{question}\nSolve the problem step by step, '
+                                'but keep the reasoning concise. Once you '
+                                'know the answer, put the final answer '
+                                'within \\boxed{} and stop immediately. '
+                                'Do not provide alternative '
+                                'interpretations, repeated checks, or any '
+                                'text after the boxed answer.'
                             ),
                         ),
                     ],
@@ -115,6 +141,8 @@ model_abbr = (
     f'-rt{_format_threshold(REMASK_THRESHOLD)}'
     f'-t{_format_threshold(TEMPERATURE)}'
     f'-rs{_format_threshold(REMASK_START_RATIO)}'
+    f'-ri{REMASK_INTERVAL_BLOCKS}'
+    f'-rw{REMASK_WINDOW_BLOCKS}'
 )
 
 models = [
@@ -137,6 +165,8 @@ models = [
             confidence_threshold=CONFIDENCE_THRESHOLD,
             remask_threshold=REMASK_THRESHOLD,
             remask_start_ratio=REMASK_START_RATIO,
+            remask_interval_blocks=REMASK_INTERVAL_BLOCKS,
+            remask_window_blocks=REMASK_WINDOW_BLOCKS,
         ),
         model_kwargs=dict(
             torch_dtype=torch_dtype,
@@ -147,7 +177,7 @@ models = [
 ]
 
 summarizer = dict(
-    dataset_abbrs=[['gsm8k', 'accuracy']],
+    dataset_abbrs=[[GSM8K_ABBR, 'accuracy']],
     summary_groups=[],
 )
 
@@ -177,5 +207,6 @@ work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar-gap')
 
 del _default_num_workers
 del _format_threshold
+del _has_model_weights
 del _os
 del _pathlib

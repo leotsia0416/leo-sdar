@@ -2,555 +2,581 @@
 
 ## 文件目的
 
-這份文件只描述目前 SDAR 1.7B remask + GRPO 訓練的當前狀態。
+這份文件只描述目前真正跑過、且已經驗證有用的 SDAR 1.7B remask + GRPO 作法。
 
-文件重點是回答三件事：
+這裡的「當前作法」不是最早的設計假說，也不是所有 script 的歷史預設，而是目前主線實驗實際採用的 recipe，核心對應：
 
-1. 現在 training state 是怎麼構造的。
-2. remask policy 現在實際作用在哪裡、怎麼 rollout、怎麼給 reward。
-3. 目前預設設定、觀察指標與已知限制是什麼。
-
----
-
-## 1. 方法總覽
-
-目前版本的核心是：
-
-> 先用 GT 固定一段 prefix，再讓模型自己生成一段局部 window，只在這段 self-generated window 的最後 3 個 blocks 內做 remask，並用 `baseline + top-k single-remask branches` 比較哪些位置的 intervention 最能改善 future diffusion loss 與 terminal answer correctness。
-
-這個版本的目標不是讓主鏈暴露在大量錯 proposal token 的髒 context 中，而是先在一段受控的 generated window 上驗證：
-
-- 哪些位置值得 remask
-- remask 後是否真的能改善最終答案
+- 訓練：`training_150446`
+- 最佳 no-remask baseline checkpoint：`checkpoint-140`
+- 主要 eval 路徑：
+  - LMDeploy no-remask
+  - HF gap decoder remask
 
 ---
 
-## 2. 資料與基本假設
+## 1. 當前已驗證有效的 recipe
 
-### 2.1 資料集
+目前最有價值的設定不是從壞掉的 checkpoint 繼續修，而是：
 
-目前預設訓練資料是 hard `MATH`：
+1. 從 base chat model 起訓
+2. hard MATH 訓練 prompt 直接加入 boxed 輸出要求
+3. 降低 diffusion / CE 權重，但不拿掉
+4. 補一個和實際 eval 對齊的 terminal correctness reward
+5. 另外補 format reward，避免被 `####` 資料格式帶偏
 
-- dataset: `math_train_hard_local`
-- row 單位: 一題一個 row
-- 不使用 packing
+這條線已經在 GSM8K 上超過原本 baseline：
 
-### 2.2 為什麼不能 packing
+- baseline：約 `80.06`
+- `training_150446/checkpoint-140` 的 LMDeploy no-remask：約 `80.59`
 
-目前 reward 包含 terminal answer correctness。
+這件事的重要性在於：
 
-terminal reward 的定義是：
-
-- rollout 到 terminal
-- 抽 final answer
-- 跟該題的 GT final answer 比對
-
-如果一個 row 裡有多題：
-
-- terminal reward 就不再是乾淨的 per-problem reward
-- final answer extraction 會混到同一 row 的多題內容
-
-因此目前版本明確要求：
-
-- `packing = false`
-- `neat_packing = false`
-
-### 2.3 長度處理
-
-目前使用：
-
-- `cutoff_len = 2048`
-- 超過 cutoff 的題目直接 drop
-
-因此訓練總題數會是「原始 hard MATH 題數」扣掉超長樣本後的數量。
+- 光靠之前的 SFT 沒有穩定超過 baseline
+- 目前這條 remask + GRPO 線至少已經出現正增益
 
 ---
 
-## 3. 當前 state 定義
+## 2. 目前實際訓練設定
 
-### 3.1 記號
+### 2.1 資料
 
-- $x_0$: ground-truth answer sequence
-- $z$: 當前 training state
-- $b_{gt}$: GT anchor block
-- $b_{rm}$: remask anchor block
-- $W = [b_{rm}-2, b_{rm}]$: 當前固定使用的 3-block remask window
+目前主線 profile 是 `hard_math`。
 
-目前 block 定義以 answer tokens 的相對順序切分，預設：
+預設 raw hard MATH 來源仍是：
+
+- `math_train_hard_local`
+
+但真正用來訓練的 dataset 已改成：
+
+- `math_train_hard_boxed_prompt_local`
+
+也就是在 hard MATH 題目的 user prompt 後面，直接加上和 eval 對齊的 boxed 指令：
+
+- step by step 但 concise
+- 最後答案放進 `\boxed{}`
+- boxed 後立刻停止
+- 不要輸出 boxed 後的補充文字
+
+這一步很重要。原因是目前部署與評測介面本來就要求 boxed 輸出；若訓練資料不帶這個 instruction，而 reward 又容忍 `####`，模型會被 MATH / GSM8K 原始資料格式帶偏。
+
+### 2.2 訓練 profile
+
+目前主線對應的有效 recipe 是：
+
+- profile: `hard_math`
+- learning rate: `5e-6`
+- epochs: `3`
+- cutoff length: `2048`
+- packing: `false`
+- neat packing: `false`
+
+### 2.3 初始化
+
+目前有效實驗不是從先前壞掉的 remask checkpoint 起訓，而是從 base model 起訓：
+
+- base model: `Models/SDAR-1.7B-Chat-`
+
+這點和早期做法不同。因為實驗上 base 明顯比某些中途 checkpoint 強，拿壞 checkpoint 當 anchor 只會把格式與生成習慣一起帶偏。
+
+---
+
+## 3. 訓練 state 與 action 設計
+
+目前訓練語義仍然是 generated-window + single-remask branch。
+
+### 3.1 State 的三段結構
+
+對每個 sample，訓練 state 由三段構成：
+
+1. 正確 prefix  
+   前段使用 GT-visible token，當成穩定前綴。
+
+2. self-generated local window  
+   中段讓模型自己生成一段 visible window。
+
+3. masked suffix  
+   後段維持 masked，留給主 diffusion loss 與 reroll 後續解。
+
+這樣做的理由是：
+
+- 前綴要夠穩，避免整條 rollout 太亂
+- remask 又必須真的作用在模型自己生成的區域上
+
+### 3.2 Block 與 remask window
+
+目前 block 單位仍是：
 
 - `block_size = 4`
 
-### 3.2 兩個 anchor
+真正允許 remask 的範圍仍是 generated window 的最後 `3` 個 blocks。
 
-對每個 sample，先抽兩個 block：
+也就是說，現在方法仍然不是在整條 answer 上隨便挑位置，而是在一個受控的 local generated window 內問：
 
-1. `GT anchor`: $b_{gt}$
-2. `remask anchor`: $b_{rm}$
+> 哪個位置最值得被打回 `[MASK]`？
 
-限制條件：
+### 3.3 Branch 結構
 
-- `b_rm` 必須至少晚於 `b_gt` 兩個 blocks，確保最後 3 個 blocks 都已經是模型自己生成的內容
-- 若長度允許，`b_rm` 不會落在最後一個 block，保留一段 masked suffix 給主 denoising loss
+目前 GRPO 仍然不是完整 stochastic subset sampling。
 
-### 3.3 state 的三段結構
-
-目前一個 sample 的 state 由三段組成：
-
-1. `blocks < b_gt`
-   使用 GT-filled token，當成正確 prefix
-
-2. `blocks in [b_gt, b_rm]`
-   由模型自己 greedy rollout 生成，形成 visible generated window
-
-3. `blocks > b_rm`
-   維持 masked，作為主 denoising 區域與 reroll 後的續解區域
-
-因此目前 state 不是純 GT-visible，也不是純 self-generated，而是：
-
-- 正確 prefix
-- self-generated local window
-- masked suffix
-
-### 3.4 這個 state 的意義
-
-這個設計要同時滿足兩件事：
-
-1. 前綴要夠穩，避免整條解碼路徑太亂
-2. remask 必須真的作用在模型自己生成的區域上，而不是對 GT token 假裝做 intervention
-
----
-
-## 4. Generated Window 與 Remask Window
-
-### 4.1 Generated Window
-
-從 `GT anchor` 到 `remask anchor` 的區間：
-
-$$
-[b_{gt}, b_{rm}]
-$$
-
-會先由模型自己用 greedy proposal 逐 block 生成，形成 visible generated window。
-
-### 4.2 Remask Window
-
-真正允許 remask 的範圍不是整段 generated window，而是其最後 3 個 blocks：
-
-$$
-W = [b_{rm}-2, b_{rm}]
-$$
-
-目前 remask 只作用在：
-
-- generated
-- visible
-- 位於最後 3 個 blocks 內
-
-的 token 上。
-
-也就是說，remask 不直接作用在：
-
-- GT prefix
-- 仍為 masked 的 suffix
-
----
-
-## 5. Remask Candidate 與 Policy
-
-### 5.1 候選位置
-
-候選位置來自 remask window 內的 visible generated tokens。
-
-這些位置對應的是：
-
-- 模型自己已經生成出來
-- 目前可以被 rollback 重寫
-- 位置上可能對後續解碼造成影響
-
-### 5.2 Remask head
-
-對每個 candidate token，remask head 輸出一個 score / logit。
-
-這個 logit 的作用有兩個：
-
-1. 做 BCE warmup / auxiliary remask loss
-2. 當成 branch ranking 的依據
-
-### 5.3 不是隨機選誰 remask
-
-目前版本不是對 candidate set 做隨機 subset sampling。
-
-branch 建法是：
+branch 結構是：
 
 - `branch 0`: baseline，不 remask
-- 其餘 branches: 各自只 remask一個位置
-- 這些位置由 remask score 做 `top-k` 排序後選出
-
-若 candidate 數量不足，實際 branch 數量是：
-
-$$
-1 + \min(K, |C|)
-$$
+- 其餘 branches：最多 `K-1` 條 single-remask branch
+- candidate 位置依 remask score 做 `top-k` 選擇
 
 目前預設：
 
 - `gap_grpo_num_samples = 8`
 
-因此目前實際上是：
+所以實際 branch 數量是：
 
-$$
-1 + \min(7, |C|)
-$$
+- `1 + min(7, candidate_count)`
 
----
+### 3.4 Reroll 語義
 
-## 6. 為什麼目前只做單點 remask
+目前 single-remask branch 的語義仍是 block-level reroll：
 
-目前只做 single-remask branch，有三個原因：
+1. 先選到某個 candidate token
+2. 找出該位置所在的最早 block
+3. 將 generated visible 區間內 `block >= b` 的 token 全部 rollback 成 `[MASK]`
+4. 從該 block 起重新 rollout 到 terminal
 
-1. credit assignment 較乾淨
-2. branch 間差異更容易解讀
-3. terminal reward 本身就高 variance，多點 remask 會讓訊號更難穩定
-
-目前版本的研究問題更接近：
-
-> 在當前 state 下，哪一個位置最值得被打回 `[MASK]`？
-
-而不是：
-
-> 哪一組多位置 remask subset 最好？
+這裡不是只改一個 token，而是從被選中的 block 往後整段重解。
 
 ---
 
-## 7. Rollout 與 Reroll 的語義
+## 4. Reward 設計
 
-### 7.1 Baseline
+目前 reward 已經不是只有 dense + terminal 兩項，而是三項：
 
-baseline branch 不做 remask，直接從目前 state 往後 rollout 到 terminal。
+1. dense reward
+2. terminal correctness reward
+3. terminal format reward
 
-### 7.2 Single-remask branch
+### 4.1 Dense reward
 
-若某個 branch 選到位置 $i$，且該位置位於 block $b$，則這個 branch 不只是把 token $i$ 打回 `[MASK]`。
-
-目前的語義是：
-
-1. 找出最早被動到的 block $b$
-2. 將 generated window 中所有 `block >= b` 的 visible generated tokens 全部 rollback 成 `[MASK]`
-3. 從 block $b$ 起重新往後 rollout 到 terminal
-
-也就是說，當 remask 發生在較早的 block 時：
-
-- 後續解碼路徑本來就應該被改寫
-- 這是方法本身要評估的效果，不是副作用
-
-### 7.3 後續 decode policy
-
-目前 reroll 與 terminal rollout 都使用 greedy decode。
-
-目前版本刻意不使用 stochastic token sampling，原因是希望：
-
-- reward 與最終 greedy inference 對齊
-- 多樣性只來自 remask intervention，而不是 token sampling 隨機性
-
-因此 branch 差異目前主要來自：
-
-- remask 哪個位置
-- reroll 從哪個 block 開始
-
-而不是 token-level sampling。
-
----
-
-## 8. 主 loss
-
-主 loss 仍然是 SDAR 的 diffusion / denoising loss。
-
-對當前 state 的 masked suffix 計算：
+dense reward 還是：
 
 $$
-L_{\text{mdm}}
+R_{dense} = -L_{future}
 $$
 
-這是整體訓練的主目標。
+其中 $L_{future}$ 是 action 之後剩餘 masked 區域的 future diffusion loss。
 
-目前 remask policy 不是拿來取代主 loss，而是作為：
+因此 dense reward 通常是負值：
 
-- 輔助 decision policy
-- 幫助找到更好的 local rewrite action
+- 越接近 `0` 越好
+- 越負表示後續更難收尾
 
----
+### 4.2 Terminal correctness reward
 
-## 9. Remask BCE 輔助項
+目前 terminal correctness reward 已經改成盡量對齊實際 eval。
 
-目前版本仍保留 remask BCE loss。
+如果 target 是單純數值答案，抽取邏輯會優先從：
 
-它的 target 不是「這個位置在抽象上該不該重寫」，而是當前 generated token 是否與 GT 不同。
+1. `\boxed{}`
+2. `answer is ...`
+3. `</think>` 後半段
+4. 尾端數字
 
-這個 BCE loss 的作用是：
+這樣可避免把 `72` 和 `72.0` 當不同答案，也比較接近 GSM8K evaluator 實際吃的東西。
 
-- 當作 warmup
-- 讓 remask head 先學到基本錯誤訊號
-- 在 RL 訊號還不穩時提供穩定梯度
+如果 target 不是單純 numeric，而是較像 symbolic / math expression，仍回退到較保守的文字正規化比對，避免把 `\frac{1}{2}` 這類答案誤判成 `2`。
 
-但設計上要清楚：
+### 4.3 Terminal format reward
 
-> 最終要學的不是 token correctness 本身，而是 action quality。
+目前新增了 format reward，目的是把模型拉回 deployment contract，而不是只要求它數值正確。
 
----
+目前 format reward 主要獎懲：
 
-## 10. Reward 定義
+- 有 `\boxed{...}`：加分
+- boxed 後沒有尾巴：再加分
+- 出現 `####`：扣分
+- `<think>` / `</think>` 不配對：扣分
 
-目前 reward 由兩部分組成：
+最後 format reward 被 clamp 到 `[-1, 1]`。
 
-### 10.1 Dense Reward
+### 4.4 總 reward
 
-dense reward 定義為：
-
-$$
-R_{\text{dense}} = -L_{\text{future}}
-$$
-
-其中 $L_{\text{future}}$ 是該 branch 在 action 之後，剩餘 masked 區域上的 future diffusion loss。
-
-因此 dense reward 通常是負的：
-
-- 越接近 `0` 代表越好
-- 越負代表 reroll 後未來越難收尾
-
-### 10.2 Terminal Reward
-
-terminal reward 定義為：
-
-- rollout 到 terminal
-- 抽 final answer
-- 和 GT final answer 做 normalize 後比對
-
-目前給的是：
+目前總 reward 為：
 
 $$
-R_{\text{terminal}} \in \{0, 1\}
-$$
-
-- 對：`1`
-- 錯：`0`
-
-這個 reward 只看最終答案是否正確，不直接評估整段 reasoning 是否逐步正確。
-
-### 10.3 Total Reward
-
-總 reward 為：
-
-$$
-R = w_d R_{\text{dense}} + w_t R_{\text{terminal}} - \alpha \cdot \mathrm{remask\_rate}
-$$
-
-目前預設：
-
-- `w_d = 0.25`
-- `w_t = 2.0`
-- `alpha = 0.0`
-
-因此目前 reward 主要由 terminal correctness 主導，dense reward 作為 shaping signal。
-
----
-
-## 11. Terminal Answer Extraction
-
-目前 terminal reward 的 final answer 抽取規則是：
-
-1. 優先抓最後一個 `\\boxed{...}`
-2. 否則抓 `#### ...`
-3. 否則抓 `answer is ...`
-4. 再不然退回最後一個非空行
-
-normalize 後做 exact match。
-
-這表示目前 terminal reward：
-
-- 已經足夠描述最終答案對不對
-- 但還不是完整數學等價判定
-
-例如某些等價形式不一定會被判成相同答案。
-
----
-
-## 12. GRPO 更新方式
-
-目前版本沒有獨立 critic，也沒有 value head。
-
-更新方式是：
-
-1. 對同一個 state 建多條 branches
-2. 算每條 branch 的 reward
-3. 在同一個 group 內做 reward normalization
-4. 用 PPO-style clipped objective 更新 remask policy
-
-因此目前是：
-
-- policy: `SDAR backbone + remask head`
-- critic: 無獨立 critic，改用 group-relative reward normalization
-
----
-
-## 13. 總 loss
-
-目前總 loss 可以寫成：
-
-$$
-L_{\text{total}}
-=
-L_{\text{mdm}}
+R =
+w_d R_{dense}
 +
-\lambda_{\text{rm}} L_{\text{bce}}
+w_t R_{terminal}
 +
-\lambda_{\text{grpo}} L_{\text{grpo}}
+w_f R_{format}
+-
+\alpha \cdot remask\_rate
 $$
 
-其中：
-
-- $L_{\text{mdm}}$: 主 diffusion / denoising loss
-- $L_{\text{bce}}$: generated-window 上的 remask BCE
-- $L_{\text{grpo}}$: branch-level action policy update
-
-目前的設計原則是：
-
-> 主 loss 仍然是主角；GRPO 是讓 remask policy 對 terminal quality 與 future loss 改善有用，而不是取代主 loss。
-
----
-
-## 14. 當前預設設定
-
-這裡記錄目前的實際預設，而不是候選方案。
-
-### 14.1 資料
-
-- dataset: `math_train_hard_local`
-- `cutoff_len = 2048`
-- `packing = false`
-- `neat_packing = false`
-
-### 14.2 狀態與 rollout
-
-- `block_size = 4`
-- `gap_rollout_steps = 4`
-- `gap_rollout_strategy = low_confidence_dynamic`
-- `gap_rollout_confidence_threshold = 0.95`
-- generated window 的 remask 範圍固定是最近 `3` 個 blocks
-
-### 14.3 Remask / GRPO
-
-- `gap_remask_threshold = 0.15`
-- `gap_remask_loss_weight = 0.05`
-- `gap_grpo_loss_weight = 0.1`
-- `gap_grpo_num_samples = 8`
-- branch 結構：`1` baseline `+` 最多 `7` single-remask branches
-
-### 14.4 Reward 權重
+目前主線有效設定是：
 
 - `gap_grpo_dense_reward_weight = 0.25`
 - `gap_grpo_terminal_reward_weight = 2.0`
+- `gap_grpo_format_reward_weight = 0.25`
 - `gap_grpo_remask_penalty = 0.0`
 
-### 14.5 Decode
+也就是：
 
-- token rollout 仍是 greedy
-- 不使用 stochastic decode
+- correctness 還是主導項
+- dense reward 負責 shaping
+- format reward 負責不讓模型被 `####` 與拖尾格式帶走
 
 ---
 
-## 15. 目前最重要的觀察指標
+## 5. 總 loss 與目前權重平衡
 
-### 15.1 主訓練
+目前總 loss 仍由三塊組成：
+
+$$
+L_{total}
+=
+w_{diff} L_{diffusion}
++
+\lambda_{rm} L_{remask\_bce}
++
+\lambda_{grpo} L_{grpo}
+$$
+
+目前主線有效設定是：
+
+- `gap_diffusion_loss_weight = 0.5`
+- `gap_remask_loss_weight = 0.05`
+- `gap_grpo_loss_weight = 0.1`
+
+這裡的重點不是把 CE 拿掉，而是：
+
+- 保留 diffusion / CE 當 anchor
+- 但把它降權，避免被資料格式直接帶走
+- 同時讓 GRPO reward 開始真正影響 remask policy
+
+目前不建議直接把 CE 歸零。原因是現在 GRPO 優化的核心仍然是 remask branch policy，不是把整個 decoder 直接改造成純 RL。
+
+---
+
+## 6. 為什麼這版比舊版更合理
+
+相對於早期版本，這次真正改對的點是：
+
+### 6.1 訓練 prompt 與 eval prompt 對齊
+
+以前 base model 會 boxed，多半是因為它本來 instruction following 不錯；後續 hard-math 訓練如果不顯式要求 boxed，反而容易把這個習慣洗掉。
+
+現在 hard MATH 訓練 prompt 已經直接加了 boxed instruction，所以模型不是只在 eval 才第一次看到這個要求。
+
+### 6.2 reward 與實際 eval 更對齊
+
+以前 terminal reward 太容易接受 `####` 或尾端數字，對 boxed 的偏好不夠明確。
+
+現在至少分成兩件事：
+
+- correctness 是否對
+- 格式是否符合 contract
+
+### 6.3 base 比壞 checkpoint 更適合當起點
+
+實驗上 base 比某些舊 checkpoint 更穩。
+
+因此目前做法已經不把「舊 checkpoint 分佈」當要維持的東西，而是直接從 base 出發。
+
+---
+
+## 7. 目前 eval 路徑的角色分工
+
+### 7.1 LMDeploy no-remask
+
+`test_gap.sh` 在：
+
+- `SDAR_USE_REMASK=false`
+
+時，實際會走 LMDeploy config。
+
+這條路徑目前的角色是：
+
+- deployment-style baseline
+- 快速、穩定、接近實際部署的 no-remask 成績
+
+目前最佳例子：
+
+- `training_150446/checkpoint-140`
+- LMDeploy no-remask：約 `80.59`
+
+### 7.2 HF gap remask
+
+`test_gap.sh` 在：
+
+- `SDAR_USE_REMASK=true`
+
+時，實際會走你自己寫的 HF gap decoder。
+
+這條路徑目前的角色是：
+
+- 驗證 remask policy 是否有用
+- 做 method analysis
+- 研究觸發時機、rollback 節奏與 remask score
+
+同一個 `checkpoint-140`，HF gap 預設 remask 也跑到約 `80.59`。
+
+### 7.3 HF gap no-remask 的 caveat
+
+目前如果在 HF gap 路徑用：
+
+- `SDAR_USE_REMASK=true`
+- `SDAR_REMASK_THRESHOLD=1.0`
+
+把 remask 關掉，這不是完全公平的「同路徑、只把 rollback 拿掉」控制組。
+
+原因是目前 code 在 threshold >= 1.0 時，還會把：
+
+- `gap_enabled = False`
+- `remask_window_blocks = 1`
+
+一起改掉。
+
+這代表這條 no-remask control 不只是「不 remask」，而是連 window / cache commit 節奏都變了。
+
+實驗上同一個 `checkpoint-140`：
+
+- HF gap remask：約 `80.59`
+- HF gap threshold=1.0 pseudo-no-remask：約 `79.15`
+
+所以這個 `79.15` 不能直接解讀成「你的 decoder 完全不行」，而要理解成：
+
+- 目前 pseudo-no-remask control 本身就帶了額外路徑改變
+
+---
+
+## 8. 當前最好怎麼解讀分數
+
+目前比較合理的分工是：
+
+1. `LMDeploy no-remask`
+   看 deployment baseline
+
+2. `HF gap remask`
+   看你的方法本身有沒有價值
+
+3. `HF gap threshold=1.0`
+   只能當近似 control，不能當完全公平的 no-remask 等價路徑
+
+也就是說，目前最該看的不是：
+
+> HF gap pseudo-no-remask 能不能直接打贏 LMDeploy
+
+而是：
+
+> 同一個 checkpoint 下，HF gap remask 能不能在你自己的 decoder 上帶來幫助
+
+---
+
+## 9. 目前 remask trigger 的語義
+
+目前 eval 端是否觸發 remask，要經過兩層判斷：
+
+### 9.1 先看 cadence / 時機
+
+只有在以下條件成立時才會檢查 remask：
+
+- 已經進到 `first_remask_block` 之後
+- `remask_progress >= remask_start_ratio`
+- 命中 `remask_interval_blocks`
+
+### 9.2 再看 remask head 分數
+
+進到可檢查時，會對 window 裡 candidate token 算：
+
+- `gap_remask_head(hidden_state)`
+- `sigmoid`
+- 取最佳 candidate 的 `best_score`
+
+只有當：
+
+- `best_score >= remask_threshold`
+
+才真的觸發 rollback。
+
+### 9.3 rollback 仍是 block-level
+
+目前觸發後，仍然不是只改一個 token，而是從該 token 所在 block 往後 rollback。
+
+在 `window=3`、`block=4` 的情況下，單次 rollback 規模其實沒有大到離譜；真正看起來極端的是某些題會連續觸發很多次。
+
+---
+
+## 10. 目前如何細看 remask 時機與頻率
+
+舊版 trace 只會記：
+
+- `steps_with_remask`
+- `total_remasked_tokens`
+
+這太粗，無法回答：
+
+- 第一個 check 在哪個 block
+- 第一個 trigger 在哪個 block
+- 分數離 threshold 差多少
+- 哪些題是一直被檢但從不觸發
+- 哪些題是從中段開始連續觸發 97 次
+
+因此目前已補了 event-level trace。
+
+現在可選擇額外記錄：
+
+- `generated_blocks`
+- `remask_progress`
+- `candidate_count`
+- `best_score`
+- `score_margin`
+- `selected_block`
+- `rollback_start`
+- `triggered`
+- `remasked_tokens`
+
+建議分析順序：
+
+1. 看 `first_check_block / first_trigger_block`
+   判斷是不是開始得太晚
+
+2. 看 `best_score` 與 `score_margin`
+   判斷是 threshold 太高，還是 head 根本沒把高風險位置拉開
+
+3. 看 `checks_per_example / triggers_per_example`
+   判斷是不是 cadence 太密，導致少數題反覆介入
+
+4. 看 `remasked_tokens_triggered_checks`
+   判斷 rollback 粒度是否過重
+
+---
+
+## 11. 目前最重要的觀察指標
+
+### 11.1 訓練期
+
+目前至少要看：
 
 - `loss`
 - `diffusion_loss`
+- `weighted_diffusion_loss`
 - `remask_loss`
-
-### 15.2 Remask / GRPO
-
+- `grpo_loss`
 - `grpo_reward`
 - `grpo_dense_reward`
 - `grpo_terminal_reward`
+- `grpo_format_reward`
 - `grpo_reward_std`
-- `grpo_policy_loss`
 - `grpo_branch_count`
 - `candidate_tokens`
 - `remask_pred_rate`
 
-### 15.3 解讀方式
+### 11.2 解讀方式
 
-- `grpo_reward_std` 太小：
-  表示 group 內 branch 差異太小，學習訊號弱
+- `weighted_diffusion_loss` 是否真的反映降權後的 CE
+- `grpo_terminal_reward` 是否有往上走
+- `grpo_format_reward` 是否從負值往 0 靠近
+- `remask_pred_rate` 是否仍遠高於真實 positive rate
+- `grpo_reward_std` 是否太小，導致 group 內沒有效學訊號
 
-- `grpo_policy_loss` 長期接近 0：
-  表示 reward 雖然有值，但 policy update 幾乎沒有效果
+目前從有效 run 來看：
 
-- `grpo_terminal_reward` 上升：
-  表示 branch rollout 的最終答案正確率在提高
-
-- `remask_pred_rate` 太低：
-  表示 remask head 可能過度保守
-
----
-
-## 16. 成功標準
-
-這個方法真正要看的不是 BCE 是否下降，而是：
-
-1. 在固定 decode budget 下，最終答案品質是否更高
-2. `grpo_terminal_reward` 是否提高
-3. `grpo_reward_std` 是否足夠大，表示 branch 間有可學差異
-4. `grpo_policy_loss` 是否不是長期趨近 0
-5. 最終 MATH / GSM8K 的答案正確率是否提升
+- boxed prompt + format reward 確實能把格式拉回來
+- 真正剩下的瓶頸多半是 correctness，不是格式
 
 ---
 
-## 17. 已知限制
+## 12. 目前已知的實驗結論
 
-### 17.1 Anchor sampling 仍偏簡單
+### 12.1 這條方法不是假的
 
-目前 `GT anchor` 與 `remask anchor` 只是從合法範圍中抽樣，還沒有額外偏向中段或高影響位置。
+目前已經有 checkpoint 超過 baseline，因此不能再把整條 remask + GRPO 線當成無效方向。
 
-### 17.2 Reward 還不是 baseline-relative
+### 12.2 `LMDeploy wrong` 不等於 hard set
 
-目前每條 branch 用的是自己的絕對 reward：
+從 LMDeploy no-remask 挑出的錯題，換成 HF gap decoder no-remask，仍能救回一部分。
 
-$$
-R = w_d R_{\text{dense}} + w_t R_{\text{terminal}}
-$$
+這代表：
 
-尚未改成：
+- `LMDeploy wrong`
 
-$$
-R_{\text{branch}} - R_{\text{baseline}}
-$$
+其實是：
 
-若之後 group 常出現全對或全錯，這會是值得優先考慮的下一步。
+- 真難題
+- 路徑敏感題
 
-### 17.3 目前只做單點 remask
+的混合，不是純 hard set。
 
-這讓 credit assignment 清楚，但還抓不到多位置交互作用。
+### 12.3 目前 remask 觸發仍偏 sparse
 
-### 17.4 Terminal reward 還不是 symbolic equivalence
+全量 GSM8K 上，預設 remask 並不是大量觸發，而是只在少數題介入。
 
-目前 final answer 判斷仍以 normalize 後的 exact match 為主，不是完整數學等價判定。
+所以目前重點還不是「每題都要 remask」，而是：
 
-### 17.5 尚未做 KV cache 優化
-
-目前 reroll 仍走完整 suffix 重算。當前優先順序是先把方法語義做對，再處理 cache 加速。
+- 哪些題型值得介入
+- 介入時機是不是太晚
+- 介入後是否真的修到 correctness
 
 ---
 
-## 18. 當前版本的定位
+## 13. 目前最重要的限制
 
-目前這版設計的定位很明確：
+### 13.1 branch 採樣仍然偏 deterministic
 
-> 固定一段正確 prefix，讓模型自己生成一段局部 window，只在這段 self-generated window 內測試哪個位置值得 remask，並用 future diffusion loss 與 terminal answer correctness 去更新 remask policy。
+現在 branch 仍是：
 
-它不是用來證明模型已經能端到端自我修正整條推理，而是用來回答：
+- baseline
+- top-k single-remask
 
-- 在局部 self-generated reasoning window 中
-- 哪些 token 值得被打回 `[MASK]`
-- 這樣做是否真的能幫助最終答案
+不是真正 stochastic multi-action GRPO。
 
-這就是目前版本的完整狀態。        
+### 13.2 沒有 explicit KL anchor
+
+目前沒有像 PPO ref-model 那樣的 explicit KL 去拉回 base distribution。
+
+當前主要穩定器仍是：
+
+- diffusion / CE
+- remask BCE
+
+### 13.3 HF gap no-remask control 仍不夠公平
+
+目前 threshold >= 1.0 會順便改變 window / commit 行為。
+
+若要做真正公平的 no-remask ablation，應該改成：
+
+- 保留 `window_blocks=3`
+- 只禁用 rollback branch
+
+### 13.4 correctness 仍是主要瓶頸
+
+目前格式問題已經比以前明顯好很多。
+
+接下來最可能帶來增益的，不是再多修 boxed，而是提升 reasoning correctness。
+
+---
+
+## 14. 目前建議的工作順序
+
+如果要沿這條線繼續做，我會建議：
+
+1. 保留目前 recipe 作為主線
+   base 起訓 + boxed prompt + diffusion 降權 + format reward
+
+2. 把 HF gap 的公平 no-remask control 補好
+
+3. 用 event trace 去分析真正的 remask trigger timing
+
+4. 若要再往上推，再考慮：
+   - explicit KL to base
+   - 更合理的 branch sampling
+   - correctness-oriented reward 強化
+
+---
+
+## 15. 一句話總結
+
+目前這版方法的定位很清楚：
+
+> 用 base chat model 當穩定起點，在 boxed-aligned 的 hard MATH 上做 generated-window remask policy learning；主 loss 仍是 diffusion，但透過 eval-aligned correctness reward 與 format reward，讓模型學會哪些 local generated positions 值得 rollback，並且不要被原始資料的 `####` 格式帶偏。
+
+這就是目前真正有效、而且已經在 GSM8K 上產生正向訊號的作法。
