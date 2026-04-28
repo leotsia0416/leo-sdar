@@ -1,5 +1,8 @@
 # flake8: noqa
 # yapf: disable
+import atexit
+import json
+import os
 import types
 from typing import Dict, List, Optional, Union
 
@@ -63,6 +66,27 @@ def _patch_block_diffusion_3d_mask(model):
         patched_update_causal_mask, inner_model
     )
     inner_model._sdar_block_diffusion_mask_patched = True
+
+
+def _is_allocation_failure(exc: BaseException) -> bool:
+    message = str(exc)
+    markers = (
+        'Cannot allocate memory',
+        "can't allocate memory",
+        'unable to mmap',
+        'std::bad_alloc',
+    )
+    return any(marker in message for marker in markers)
+
+
+def _normalize_dispatch_device_map(device_map):
+    if device_map == 'cuda':
+        if torch.cuda.is_available():
+            return {'': f'cuda:{torch.cuda.current_device()}'}
+        return {'': 'cpu'}
+    if device_map == 'npu':
+        return {'': 'npu'}
+    return device_map
 
 
 def _should_fallback_variable_length_batch(tokens):
@@ -130,6 +154,46 @@ def _prepare_block_diffusion_batch(prompt, mask_id, gen_length, block_length, de
         position_ids,
         x,
     )
+
+
+def _install_forward_counter(model, logger, model_path: Optional[str] = None):
+    if getattr(model, '_sdar_forward_counter_installed', False):
+        return
+
+    output_path = os.getenv('SDAR_FORWARD_COUNT_PATH', '').strip()
+    model._sdar_forward_count = 0
+    original_forward = model.forward
+
+    def counted_forward(self, *args, **kwargs):
+        self._sdar_forward_count = int(getattr(self, '_sdar_forward_count', 0)) + 1
+        return original_forward(*args, **kwargs)
+
+    model.forward = types.MethodType(counted_forward, model)
+    model._sdar_forward_counter_installed = True
+
+    if not output_path:
+        return
+
+    def dump_forward_count():
+        record = {
+            'pid': os.getpid(),
+            'model_path': model_path,
+            'model_class': model.__class__.__name__,
+            'forward_calls': int(getattr(model, '_sdar_forward_count', 0)),
+        }
+        try:
+            parent = os.path.dirname(output_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(output_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            if logger is not None:
+                logger.warning(f'Failed to write forward count to {output_path}: {exc}')
+
+    atexit.register(dump_forward_count)
+    if logger is not None:
+        logger.info(f'Forward counter enabled: {output_path}')
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -618,7 +682,7 @@ class BD3withChatTemplate(BaseModel):
         raise ValueError('pad_token_id is not set for this tokenizer. Please set `pad_token_id={PAD_TOKEN_ID}` in model_cfg.')
 
     def _load_model(self, path: str, kwargs: dict, peft_path: Optional[str] = None, peft_kwargs: dict = dict()):
-        from transformers import AutoModel, AutoModelForCausalLM
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
         DEFAULT_MODEL_KWARGS = dict(device_map='cuda', trust_remote_code=True)
         model_kwargs = DEFAULT_MODEL_KWARGS
@@ -628,11 +692,67 @@ class BD3withChatTemplate(BaseModel):
         if is_npu_available():
             model_kwargs['device_map'] = 'npu'
 
+        def load_via_dispatch(auto_cls):
+            from accelerate import load_checkpoint_and_dispatch
+
+            config = AutoConfig.from_pretrained(
+                path,
+                trust_remote_code=model_kwargs.get('trust_remote_code', True),
+            )
+            from_config_kwargs = {}
+            if 'torch_dtype' in model_kwargs:
+                from_config_kwargs['torch_dtype'] = model_kwargs['torch_dtype']
+            with torch.device('meta'):
+                model = auto_cls.from_config(
+                    config,
+                    trust_remote_code=model_kwargs.get('trust_remote_code', True),
+                    **from_config_kwargs,
+                )
+            if hasattr(model, 'tie_weights'):
+                model.tie_weights()
+            dispatch_kwargs = dict(
+                device_map=_normalize_dispatch_device_map(model_kwargs.get('device_map', 'cuda')),
+            )
+            if 'torch_dtype' in model_kwargs:
+                dispatch_kwargs['dtype'] = model_kwargs['torch_dtype']
+            return load_checkpoint_and_dispatch(model, path, **dispatch_kwargs)
+
         try:
             self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
             # self.model = self.model.to(torch.float16)
+        except RuntimeError as exc:
+            if _is_allocation_failure(exc):
+                self.logger.warning(
+                    'Falling back to accelerate meta-init loading after allocation failure: '
+                    f'{exc}'
+                )
+                self.model = load_via_dispatch(AutoModelForCausalLM)
+            else:
+                raise
+        except MemoryError as exc:
+            self.logger.warning(
+                'Falling back to accelerate meta-init loading after MemoryError: '
+                f'{exc}'
+            )
+            self.model = load_via_dispatch(AutoModelForCausalLM)
         except ValueError:
-            self.model = AutoModel.from_pretrained(path, **model_kwargs)
+            try:
+                self.model = AutoModel.from_pretrained(path, **model_kwargs)
+            except RuntimeError as exc:
+                if _is_allocation_failure(exc):
+                    self.logger.warning(
+                        'Falling back to accelerate meta-init loading after allocation failure: '
+                        f'{exc}'
+                    )
+                    self.model = load_via_dispatch(AutoModel)
+                else:
+                    raise
+            except MemoryError as exc:
+                self.logger.warning(
+                    'Falling back to accelerate meta-init loading after MemoryError: '
+                    f'{exc}'
+                )
+                self.model = load_via_dispatch(AutoModel)
 
         if peft_path is not None:
             from peft import PeftModel
@@ -643,6 +763,7 @@ class BD3withChatTemplate(BaseModel):
         print(f"model 参数类型: {next(self.model.parameters()).dtype}")
         self.model.eval()
         _patch_block_diffusion_3d_mask(self.model)
+        _install_forward_counter(self.model, self.logger, model_path=path)
         self.model.generation_config.do_sample = False
 
     def get_ppl_tokenwise(self, inputs: List[str], label: List[List[int]], mask_length: Optional[List[int]] = None) -> List[float]:

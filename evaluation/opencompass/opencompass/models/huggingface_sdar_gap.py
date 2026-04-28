@@ -16,9 +16,34 @@ from .huggingface_bd3 import (
     _get_stopping_criteria,
     _match_stop_sequences,
     _prepare_block_diffusion_batch,
+    block_diffusion_generate,
     get_num_transfer_tokens,
     sample_with_temperature_topk_topp,
 )
+
+
+def _collect_trace_token_snapshots(
+    x: torch.LongTensor,
+    window_inputs: torch.LongTensor,
+    prompt_length: int,
+    window_token_start: int,
+):
+    generated_window_start = max(prompt_length - window_token_start, 0)
+    generated_window = window_inputs[:, generated_window_start:]
+    prefix = x[:, prompt_length:window_token_start]
+    if prefix.shape[1] > 0:
+        generated_prefix = torch.cat((prefix, generated_window), dim=1)
+    else:
+        generated_prefix = generated_window
+    return generated_prefix.detach().cpu().tolist(), generated_window.detach().cpu().tolist()
+
+
+def _map_gap_strategy_to_bd3(strategy: str) -> str:
+    if strategy == 'random':
+        return 'random'
+    return 'low_confidence'
+
+
 def _select_block_positions(
     block_scores: torch.FloatTensor,
     masked_local_indices: torch.LongTensor,
@@ -150,7 +175,7 @@ def _decode_masked_window(
 
 
 @torch.no_grad()
-def _select_window_remask_position(
+def _select_window_remask_tokens(
     model,
     window_inputs,
     window_attention_mask,
@@ -160,12 +185,7 @@ def _select_window_remask_position(
     remask_threshold,
 ):
     batch_size = window_inputs.shape[0]
-    selected_indices = torch.full(
-        (batch_size,),
-        -1,
-        dtype=torch.long,
-        device=window_inputs.device,
-    )
+    remask_mask = torch.zeros_like(candidate_mask)
     best_scores = torch.full(
         (batch_size,),
         float('-inf'),
@@ -174,7 +194,7 @@ def _select_window_remask_position(
     )
     candidate_counts = candidate_mask.sum(dim=1, dtype=torch.long)
     if not candidate_mask.any():
-        return selected_indices, best_scores, candidate_counts
+        return remask_mask, best_scores, candidate_counts
 
     outputs = model(
         window_inputs,
@@ -188,10 +208,9 @@ def _select_window_remask_position(
     hidden_states = outputs.hidden_states[-1]
     remask_probs = torch.sigmoid(model.gap_remask_head(hidden_states).squeeze(-1))
     candidate_scores = remask_probs.masked_fill(~candidate_mask, float('-inf'))
-    best_scores, best_indices = candidate_scores.max(dim=1)
-    valid_rows = torch.isfinite(best_scores) & best_scores.ge(remask_threshold)
-    selected_indices[valid_rows] = best_indices[valid_rows]
-    return selected_indices, best_scores, candidate_counts
+    best_scores = candidate_scores.max(dim=1).values
+    remask_mask = candidate_mask & remask_probs.ge(remask_threshold)
+    return remask_mask, best_scores, candidate_counts
 
 
 @torch.no_grad()
@@ -238,6 +257,9 @@ def block_diffusion_gap_generate(
     remask_start_ratio=0.0,
     remask_interval_blocks=1,
     remask_window_blocks=3,
+    remask_start_tokens=None,
+    remask_prefix_guard_tokens=None,
+    remask_tail_guard_blocks=0,
     stopping_criteria_sequences=None,
     trace_inputs=None,
 ):
@@ -253,22 +275,38 @@ def block_diffusion_gap_generate(
     gap_enabled = bool(getattr(model.config, 'gap_enable', False)) and hasattr(model, 'gap_remask_head')
     remask_window_blocks = max(1, int(remask_window_blocks))
     remask_interval_blocks = max(1, int(remask_interval_blocks))
+    remask_start_tokens = (
+        None if remask_start_tokens is None else max(0, int(remask_start_tokens))
+    )
+    if remask_prefix_guard_tokens is None:
+        remask_prefix_guard_tokens = remask_start_tokens or 0
+    else:
+        remask_prefix_guard_tokens = max(0, int(remask_prefix_guard_tokens))
+    remask_tail_guard_blocks = max(0, int(remask_tail_guard_blocks))
     remask_disabled = (not gap_enabled) or remask_threshold >= 1.0
     if remask_disabled:
         gap_enabled = False
         # No remask means no future rollback, so we can commit every finished block immediately.
         remask_window_blocks = 1
     total_generation_blocks = max(num_blocks - prefill_blocks, 1)
-    first_remask_block = max(
-        remask_window_blocks,
-        int(math.ceil(total_generation_blocks * remask_start_ratio)),
-    )
+    if remask_start_tokens is None:
+        first_remask_block = max(
+            remask_window_blocks,
+            int(math.ceil(total_generation_blocks * remask_start_ratio)),
+        )
+    else:
+        first_remask_block = max(
+            remask_window_blocks,
+            int(math.ceil(remask_start_tokens / block_length)),
+        )
     window_start_block = prefill_blocks
     steps_with_remask = torch.zeros(batch_size, dtype=torch.long, device=x.device)
     total_remasked_tokens = torch.zeros(batch_size, dtype=torch.long, device=x.device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
     event_trace_path = os.getenv('SDAR_REMASK_EVENT_TRACE_PATH')
     event_trace_records = [] if event_trace_path else None
+    if trace_inputs is None:
+        trace_inputs = [None] * batch_size
 
     if prefill_length > 0:
         cur_x = x[:, :prefill_length]
@@ -324,25 +362,80 @@ def block_diffusion_gap_generate(
             rollout_strategy=remasking_strategy,
             confidence_threshold=confidence_threshold,
         )
+        trace_records_by_row = None
+        if event_trace_records is not None:
+            full_before_token_ids, window_before_token_ids = _collect_trace_token_snapshots(
+                x=x,
+                window_inputs=window_inputs,
+                prompt_length=prompt_length,
+                window_token_start=window_token_start,
+            )
+            trace_records_by_row = {}
+            for row_idx in range(batch_size):
+                if bool(finished[row_idx].item()):
+                    continue
+                trace_records_by_row[row_idx] = {
+                    'input': trace_inputs[row_idx],
+                    'block_idx': int(block_idx),
+                    'window_start_block': int(window_start_block),
+                    'window_token_start': int(window_token_start),
+                    'window_token_end': int(window_token_end),
+                    'generated_blocks': None,
+                    'total_generation_blocks': int(total_generation_blocks),
+                    'first_remask_block': int(first_remask_block),
+                    'remask_progress': None,
+                    'prompt_length': int(prompt_length),
+                    'remask_active': False,
+                    'candidate_count': 0,
+                    'best_score': None,
+                    'score_margin': None,
+                    'remask_threshold': float(remask_threshold),
+                    'candidate_positions': [],
+                    'remasked_positions': [],
+                    'triggered': False,
+                    'remasked_tokens': 0,
+                    'generated_before_token_ids': full_before_token_ids[row_idx],
+                    'window_before_token_ids': window_before_token_ids[row_idx],
+                    'generated_with_masks_token_ids': None,
+                    'window_with_masks_token_ids': None,
+                    'generated_after_token_ids': full_before_token_ids[row_idx],
+                    'window_after_token_ids': window_before_token_ids[row_idx],
+                }
 
         generated_blocks = (block_idx - prefill_blocks) + 1
         remask_progress = generated_blocks / total_generation_blocks
-        remask_active = (
-            gap_enabled
-            and generated_blocks >= first_remask_block
-            and remask_progress >= remask_start_ratio
-            and (generated_blocks - first_remask_block) % remask_interval_blocks == 0
-        )
+        remask_active = gap_enabled and generated_blocks >= first_remask_block
+        if remask_start_tokens is None:
+            remask_active = remask_active and remask_progress >= remask_start_ratio
+        remask_active = remask_active and (generated_blocks - first_remask_block) % remask_interval_blocks == 0
+        if trace_records_by_row is not None:
+            for row_idx, record in trace_records_by_row.items():
+                record['generated_blocks'] = int(generated_blocks)
+                record['remask_progress'] = float(remask_progress)
+                record['remask_active'] = bool(remask_active)
 
         if remask_active:
+            stop_finished = torch.zeros_like(finished)
+            if stopping_criteria_sequences:
+                generated_prefix = torch.cat(
+                    (
+                        x[:, prompt_length:window_token_start],
+                        window_inputs[:, max(prompt_length - window_token_start, 0):],
+                    ),
+                    dim=1,
+                )
+                stop_finished = _match_stop_sequences(generated_prefix, stopping_criteria_sequences)
             global_positions = torch.arange(window_token_start, window_token_end, device=x.device).unsqueeze(0)
-            active_rows = ~finished
+            active_rows = ~(finished | stop_finished)
             candidate_mask = (
-                global_positions.ge(prompt_length)
+                global_positions.ge(prompt_length + remask_prefix_guard_tokens)
                 & window_inputs.ne(mask_id)
                 & active_rows.unsqueeze(1)
             )
-            selected_flat_indices, best_scores, candidate_counts = _select_window_remask_position(
+            if remask_tail_guard_blocks > 0:
+                tail_guard_start = window_token_end - remask_tail_guard_blocks * block_length
+                candidate_mask &= global_positions.lt(tail_guard_start)
+            remask_mask, best_scores, candidate_counts = _select_window_remask_tokens(
                 model=model,
                 window_inputs=window_inputs,
                 window_attention_mask=window_attention_mask,
@@ -351,23 +444,8 @@ def block_diffusion_gap_generate(
                 candidate_mask=candidate_mask,
                 remask_threshold=remask_threshold,
             )
-            local_positions = torch.arange(window_inputs.shape[1], device=x.device).unsqueeze(0)
-            selected_blocks = torch.div(
-                selected_flat_indices.clamp_min(0),
-                block_length,
-                rounding_mode='floor',
-            )
-            rollback_starts = selected_blocks * block_length
-            selected_valid = selected_flat_indices.ge(0).unsqueeze(1)
-            rollback_mask = (
-                candidate_mask
-                & selected_valid
-                & local_positions.ge(rollback_starts.unsqueeze(1))
-            )
-            remask_counts = rollback_mask.sum(dim=1)
-            if event_trace_records is not None:
-                if trace_inputs is None:
-                    trace_inputs = [None] * batch_size
+            remask_counts = remask_mask.sum(dim=1)
+            if trace_records_by_row is not None:
                 for row_idx in range(batch_size):
                     if not bool(active_rows[row_idx].item()):
                         continue
@@ -376,34 +454,37 @@ def block_diffusion_gap_generate(
                     if torch.isfinite(best_scores[row_idx]):
                         best_score_value = float(best_scores[row_idx].item())
                         score_margin = best_score_value - float(remask_threshold)
-                    selected_flat_index = int(selected_flat_indices[row_idx].item())
-                    selected_block = None
-                    rollback_start = None
-                    if selected_flat_index >= 0:
-                        selected_block = int(selected_blocks[row_idx].item())
-                        rollback_start = int(rollback_starts[row_idx].item())
-                    event_trace_records.append({
-                        'input': trace_inputs[row_idx],
-                        'block_idx': int(block_idx),
-                        'generated_blocks': int(generated_blocks),
-                        'total_generation_blocks': int(total_generation_blocks),
-                        'first_remask_block': int(first_remask_block),
-                        'remask_progress': float(remask_progress),
-                        'window_token_start': int(window_token_start),
-                        'window_token_end': int(window_token_end),
-                        'prompt_length': int(prompt_length),
-                        'candidate_count': int(candidate_counts[row_idx].item()),
-                        'best_score': best_score_value,
-                        'score_margin': score_margin,
-                        'remask_threshold': float(remask_threshold),
-                        'selected_flat_index': selected_flat_index,
-                        'selected_block': selected_block,
-                        'rollback_start': rollback_start,
-                        'triggered': bool(remask_counts[row_idx].item() > 0),
-                        'remasked_tokens': int(remask_counts[row_idx].item()),
-                    })
+                    record = trace_records_by_row.get(row_idx)
+                    if record is None:
+                        continue
+                    record['candidate_count'] = int(candidate_counts[row_idx].item())
+                    record['best_score'] = best_score_value
+                    record['score_margin'] = score_margin
+                    record['triggered'] = bool(remask_counts[row_idx].item() > 0)
+                    record['remasked_tokens'] = int(remask_counts[row_idx].item())
+                    record['candidate_positions'] = [
+                        int(pos)
+                        for pos in global_positions[0][candidate_mask[row_idx]].detach().cpu().tolist()
+                    ]
+                    record['remasked_positions'] = [
+                        int(pos)
+                        for pos in global_positions[0][remask_mask[row_idx]].detach().cpu().tolist()
+                    ]
             if remask_counts.any():
-                window_inputs[rollback_mask] = mask_id
+                # In inference we remask only the tokens the head flags inside the latest window.
+                window_inputs[remask_mask] = mask_id
+                if trace_records_by_row is not None:
+                    full_masked_token_ids, window_masked_token_ids = _collect_trace_token_snapshots(
+                        x=x,
+                        window_inputs=window_inputs,
+                        prompt_length=prompt_length,
+                        window_token_start=window_token_start,
+                    )
+                    for row_idx, record in trace_records_by_row.items():
+                        if not record['triggered']:
+                            continue
+                        record['generated_with_masks_token_ids'] = full_masked_token_ids[row_idx]
+                        record['window_with_masks_token_ids'] = window_masked_token_ids[row_idx]
                 steps_with_remask += remask_counts.gt(0).to(dtype=torch.long)
                 total_remasked_tokens += remask_counts.to(dtype=torch.long)
                 window_inputs = _decode_masked_window(
@@ -421,10 +502,25 @@ def block_diffusion_gap_generate(
                     rollout_strategy=remasking_strategy,
                     confidence_threshold=confidence_threshold,
                 )
+                if trace_records_by_row is not None:
+                    full_after_token_ids, window_after_token_ids = _collect_trace_token_snapshots(
+                        x=x,
+                        window_inputs=window_inputs,
+                        prompt_length=prompt_length,
+                        window_token_start=window_token_start,
+                    )
+                    for row_idx, record in trace_records_by_row.items():
+                        if not record['triggered']:
+                            continue
+                        record['generated_after_token_ids'] = full_after_token_ids[row_idx]
+                        record['window_after_token_ids'] = window_after_token_ids[row_idx]
 
         if finished.any():
             window_inputs[finished] = frozen_window_inputs[finished]
         x[:, window_slice] = window_inputs
+        if trace_records_by_row is not None:
+            for row_idx in sorted(trace_records_by_row):
+                event_trace_records.append(trace_records_by_row[row_idx])
 
         if stopping_criteria_sequences:
             generated_prefix = x[:, prompt_length:window_token_end]
@@ -435,8 +531,6 @@ def block_diffusion_gap_generate(
     trace_path = os.getenv('SDAR_REMASK_TRACE_PATH')
     if trace_path:
         with open(trace_path, 'a', encoding='utf-8') as f:
-            if trace_inputs is None:
-                trace_inputs = [None] * batch_size
             for row_idx in range(batch_size):
                 record = {
                     'input': trace_inputs[row_idx],
@@ -444,8 +538,11 @@ def block_diffusion_gap_generate(
                     'total_remasked_tokens': int(total_remasked_tokens[row_idx].item()),
                     'gap_enabled': gap_enabled,
                     'remask_start_ratio': remask_start_ratio,
+                    'remask_start_tokens': remask_start_tokens,
+                    'remask_prefix_guard_tokens': remask_prefix_guard_tokens,
                     'remask_interval_blocks': remask_interval_blocks,
                     'remask_window_blocks': remask_window_blocks,
+                    'remask_tail_guard_blocks': remask_tail_guard_blocks,
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + '\n')
     if event_trace_path and event_trace_records:
@@ -564,6 +661,8 @@ class SDARGapwithChatTemplate(BD3withChatTemplate):
                 stopping_criteria=stopping_criteria,
                 generation_kwargs=generation_kwargs,
             )
+        if decode_backend not in {'gap', 'bd3'}:
+            raise ValueError(f'Unsupported decode backend: {decode_backend}')
 
         if stopping_criteria:
             generation_kwargs['stopping_criteria'] = _get_stopping_criteria(
@@ -606,33 +705,78 @@ class SDARGapwithChatTemplate(BD3withChatTemplate):
                     group_value = group_value[:, -group_prompt_len:]
                 group_tokens[key] = group_value
 
-            outputs = block_diffusion_gap_generate(
-                self.model,
-                self.tokenizer,
-                group_tokens,
-                mask_id=generation_kwargs.get('mask_id', self.model.config.mask_token_id),
-                gen_length=generation_kwargs.get('gen_length', max_out_len),
-                block_length=generation_kwargs.get(
-                    'block_length', getattr(self.model.config, 'block_size', 4)
-                ),
-                denoising_steps=generation_kwargs.get(
-                    'denoising_steps',
-                    generation_kwargs.get('block_length', getattr(self.model.config, 'block_size', 4)),
-                ),
-                temperature=generation_kwargs.get('temperature', 0.0),
-                top_k=generation_kwargs.get('top_k', 0),
-                top_p=generation_kwargs.get('top_p', 1.0),
-                remasking_strategy=generation_kwargs.get('remasking_strategy', 'low_confidence_dynamic'),
-                confidence_threshold=generation_kwargs.get('confidence_threshold', 1.0),
-                remask_threshold=generation_kwargs.get(
-                    'remask_threshold', getattr(self.model.config, 'gap_remask_threshold', 0.15)
-                ),
-                remask_start_ratio=generation_kwargs.get('remask_start_ratio', 0.0),
-                remask_interval_blocks=generation_kwargs.get('remask_interval_blocks', 1),
-                remask_window_blocks=generation_kwargs.get('remask_window_blocks', 3),
-                stopping_criteria_sequences=stopping_criteria_sequences,
-                trace_inputs=[inputs[row_idx] for row_idx in row_indices],
-            )[:, group_tokens['input_ids'].shape[1] :]
+            if decode_backend == 'bd3':
+                outputs = block_diffusion_generate(
+                    self.model,
+                    self.tokenizer,
+                    group_tokens,
+                    mask_id=generation_kwargs.get('mask_id', self.model.config.mask_token_id),
+                    gen_length=generation_kwargs.get('gen_length', max_out_len),
+                    block_length=generation_kwargs.get(
+                        'block_length', getattr(self.model.config, 'block_size', 4)
+                    ),
+                    denoising_steps=generation_kwargs.get(
+                        'denoising_steps',
+                        generation_kwargs.get('block_length', getattr(self.model.config, 'block_size', 4)),
+                    ),
+                    temperature=generation_kwargs.get('temperature', 0.0),
+                    top_k=generation_kwargs.get('top_k', 0),
+                    top_p=generation_kwargs.get('top_p', 1.0),
+                    remasking=_map_gap_strategy_to_bd3(
+                        generation_kwargs.get(
+                            'remasking_strategy',
+                            getattr(self.model.config, 'gap_rollout_strategy', 'low_confidence_dynamic'),
+                        )
+                    ),
+                    threshold=generation_kwargs.get(
+                        'confidence_threshold',
+                        getattr(self.model.config, 'gap_rollout_confidence_threshold', 0.95),
+                    ),
+                    stopping_criteria_sequences=stopping_criteria_sequences,
+                )[:, group_tokens['input_ids'].shape[1] :]
+            else:
+                outputs = block_diffusion_gap_generate(
+                    self.model,
+                    self.tokenizer,
+                    group_tokens,
+                    mask_id=generation_kwargs.get('mask_id', self.model.config.mask_token_id),
+                    gen_length=generation_kwargs.get('gen_length', max_out_len),
+                    block_length=generation_kwargs.get(
+                        'block_length', getattr(self.model.config, 'block_size', 4)
+                    ),
+                    denoising_steps=generation_kwargs.get(
+                        'denoising_steps',
+                        generation_kwargs.get('block_length', getattr(self.model.config, 'block_size', 4)),
+                    ),
+                    temperature=generation_kwargs.get('temperature', 0.0),
+                    top_k=generation_kwargs.get('top_k', 0),
+                    top_p=generation_kwargs.get('top_p', 1.0),
+                    remasking_strategy=generation_kwargs.get(
+                        'remasking_strategy',
+                        getattr(self.model.config, 'gap_rollout_strategy', 'low_confidence_dynamic'),
+                    ),
+                    confidence_threshold=generation_kwargs.get(
+                        'confidence_threshold',
+                        getattr(self.model.config, 'gap_rollout_confidence_threshold', 0.95),
+                    ),
+                    remask_threshold=generation_kwargs.get(
+                        'remask_threshold', getattr(self.model.config, 'gap_remask_threshold', 0.5)
+                    ),
+                    remask_start_ratio=generation_kwargs.get('remask_start_ratio', 0.0),
+                    remask_interval_blocks=generation_kwargs.get('remask_interval_blocks', 1),
+                    remask_window_blocks=generation_kwargs.get(
+                        'remask_window_blocks',
+                        getattr(self.model.config, 'gap_remask_window_blocks', 5),
+                    ),
+                    remask_start_tokens=generation_kwargs.get('remask_start_tokens', 192),
+                    remask_prefix_guard_tokens=generation_kwargs.get(
+                        'remask_prefix_guard_tokens',
+                        generation_kwargs.get('remask_start_tokens', 192),
+                    ),
+                    remask_tail_guard_blocks=generation_kwargs.get('remask_tail_guard_blocks', 1),
+                    stopping_criteria_sequences=stopping_criteria_sequences,
+                    trace_inputs=[inputs[row_idx] for row_idx in row_indices],
+                )[:, group_tokens['input_ids'].shape[1] :]
 
             group_decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
             group_decodeds = [text.replace('<|MASK|>', '') for text in group_decodeds]

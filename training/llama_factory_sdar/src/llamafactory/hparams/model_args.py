@@ -279,6 +279,26 @@ class BaseModelArguments:
         default=None,
         metadata={"help": "Number of remask action samples drawn per state for GAP GRPO."},
     )
+    gap_grpo_num_parents: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of parent rollouts sampled per state before constructing paired no-remask/remask GAP GRPO branches."},
+    )
+    gap_grpo_min_visible_blocks: Optional[int] = field(
+        default=None,
+        metadata={"help": "Minimum number of generated answer blocks before GAP GRPO may start rollback/remask branching."},
+    )
+    gap_grpo_candidate_window_blocks: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of generated answer blocks exposed as rollback candidates for GAP GRPO branching."},
+    )
+    gap_grpo_anchor_bias_power: Optional[float] = field(
+        default=None,
+        metadata={"help": "Power-law bias applied when sampling GAP GRPO anchors. Values > 1.0 bias anchors earlier in the answer."},
+    )
+    gap_grpo_diverse_rollbacks: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Whether GAP GRPO should spread rollback branches across the candidate window instead of only taking the top-salience blocks."},
+    )
     gap_grpo_clip_eps: Optional[float] = field(
         default=None,
         metadata={"help": "Clipping epsilon used by the PPO-style GAP GRPO objective."},
@@ -310,6 +330,38 @@ class BaseModelArguments:
     gap_grpo_format_reward_weight: Optional[float] = field(
         default=None,
         metadata={"help": "Weight applied to the terminal output-format reward inside GAP GRPO."},
+    )
+    gap_grpo_mixed_terminal_filter: Optional[bool] = field(
+        default=None,
+        metadata={"help": "If enabled, update GAP GRPO only on groups with both correct and incorrect terminal branches."},
+    )
+    gap_grpo_correct_threshold: Optional[float] = field(
+        default=None,
+        metadata={"help": "Terminal reward threshold used to count a GAP GRPO branch as correct for mixed-group filtering."},
+    )
+    gap_grpo_min_correct_count: Optional[int] = field(
+        default=None,
+        metadata={"help": "Minimum number of correct terminal branches required for a GAP GRPO group to be kept."},
+    )
+    gap_grpo_max_correct_count: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum number of correct terminal branches allowed for a GAP GRPO group. Negative means branch_count - 1."},
+    )
+    gap_grpo_rollout_temperature: Optional[float] = field(
+        default=None,
+        metadata={"help": "Temperature for stochastic sampling during GAP GRPO terminal rollouts. 0 = greedy argmax."},
+    )
+    gap_grpo_initial_rollout_temperature: Optional[float] = field(
+        default=None,
+        metadata={"help": "Temperature for stochastic sampling while building the initial GAP GRPO generated window. 0 = greedy argmax."},
+    )
+    gap_grpo_rollout_top_k: Optional[int] = field(
+        default=None,
+        metadata={"help": "Top-k truncation used for stochastic GAP GRPO proposal sampling. 0 disables top-k truncation."},
+    )
+    gap_grpo_rollout_top_p: Optional[float] = field(
+        default=None,
+        metadata={"help": "Top-p truncation used for stochastic GAP GRPO proposal sampling. 1.0 disables top-p truncation."},
     )
 
     def __post_init__(self):

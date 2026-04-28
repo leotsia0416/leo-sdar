@@ -170,6 +170,211 @@ class PissaConvertCallback(TrainerCallback):
                 setattr(model.peft_config["default"], "init_lora_weights", init_lora_weights)
 
 
+class GapRemaskThresholdSchedulerCallback(TrainerCallback):
+    r"""Update GAP remask threshold during training based on progress."""
+
+    def __init__(self, schedule: list[tuple[float, float]]) -> None:
+        if not schedule:
+            raise ValueError("GapRemaskThresholdSchedulerCallback requires a non-empty schedule.")
+
+        self.schedule = sorted(schedule, key=lambda item: item[0])
+        self._last_threshold: Optional[float] = None
+
+    @staticmethod
+    def from_env() -> Optional["GapRemaskThresholdSchedulerCallback"]:
+        raw_schedule = os.getenv("SDAR_GAP_REMASK_THRESHOLD_SCHEDULE", "").strip()
+        if not raw_schedule:
+            return None
+
+        schedule: list[tuple[float, float]] = []
+        for entry in raw_schedule.split(","):
+            item = entry.strip()
+            if not item:
+                continue
+
+            if ":" not in item:
+                raise ValueError(
+                    "Invalid SDAR_GAP_REMASK_THRESHOLD_SCHEDULE entry "
+                    f"{item!r}; expected progress:threshold pairs."
+                )
+
+            progress_str, threshold_str = item.split(":", 1)
+            progress = float(progress_str)
+            threshold = float(threshold_str)
+            if not (0.0 <= progress <= 1.0):
+                raise ValueError(f"Schedule progress must be in [0, 1], got {progress}.")
+            if not (0.0 <= threshold <= 1.0):
+                raise ValueError(f"Schedule threshold must be in [0, 1], got {threshold}.")
+            schedule.append((progress, threshold))
+
+        if not schedule:
+            return None
+
+        logger.info_rank0(f"Enabled GAP remask threshold schedule: {raw_schedule}")
+        return GapRemaskThresholdSchedulerCallback(schedule)
+
+    def _resolve_configs(self, model: Any) -> list[Any]:
+        pending = [model]
+        seen: set[int] = set()
+        configs: list[Any] = []
+
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in seen:
+                continue
+
+            seen.add(id(current))
+            config = getattr(current, "config", None)
+            if config is not None and all(id(existing) != id(config) for existing in configs):
+                configs.append(config)
+
+            for attr in ("module", "model", "pretrained_model"):
+                nested = getattr(current, attr, None)
+                if nested is not None and id(nested) not in seen:
+                    pending.append(nested)
+
+        return configs
+
+    def _threshold_for_progress(self, progress: float) -> float:
+        threshold = self.schedule[0][1]
+        for start_progress, start_threshold in self.schedule:
+            if progress + 1e-12 >= start_progress:
+                threshold = start_threshold
+            else:
+                break
+        return threshold
+
+    def _apply_threshold(self, model: Any, state: "TrainerState") -> None:
+        max_steps = max(int(state.max_steps), 1)
+        progress = min(max(float(state.global_step) / float(max_steps), 0.0), 1.0)
+        threshold = self._threshold_for_progress(progress)
+
+        if self._last_threshold is not None and abs(self._last_threshold - threshold) < 1e-12:
+            return
+
+        for config in self._resolve_configs(model):
+            setattr(config, "gap_remask_threshold", threshold)
+
+        self._last_threshold = threshold
+        logger.info_rank0(
+            "Set GAP remask threshold to "
+            f"{threshold:.3f} at step {state.global_step}/{state.max_steps} (progress={progress:.3f})."
+        )
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        self._apply_threshold(kwargs.get("model"), state)
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        self._apply_threshold(kwargs.get("model"), state)
+
+
+class GapConfigValueSchedulerCallback(TrainerCallback):
+    r"""Schedule an arbitrary GAP config value based on training progress.
+
+    Reads ``SDAR_GAP_{KEY}_SCHEDULE`` from the environment where ``KEY`` is
+    the upper-cased version of *config_key*.  The format is identical to the
+    threshold schedule: ``progress:value,...``
+    """
+
+    def __init__(self, config_key: str, schedule: list[tuple[float, float]]) -> None:
+        if not schedule:
+            raise ValueError(f"GapConfigValueSchedulerCallback({config_key}) requires a non-empty schedule.")
+
+        self.config_key = config_key
+        self.schedule = sorted(schedule, key=lambda item: item[0])
+        self._last_value: Optional[float] = None
+
+    @staticmethod
+    def from_env(config_key: str) -> Optional["GapConfigValueSchedulerCallback"]:
+        env_name = f"SDAR_{config_key.upper()}_SCHEDULE"
+        raw_schedule = os.getenv(env_name, "").strip()
+        if not raw_schedule:
+            return None
+
+        schedule: list[tuple[float, float]] = []
+        for entry in raw_schedule.split(","):
+            item = entry.strip()
+            if not item:
+                continue
+
+            if ":" not in item:
+                raise ValueError(
+                    f"Invalid {env_name} entry "
+                    f"{item!r}; expected progress:value pairs."
+                )
+
+            progress_str, value_str = item.split(":", 1)
+            progress = float(progress_str)
+            value = float(value_str)
+            if not (0.0 <= progress <= 1.0):
+                raise ValueError(f"Schedule progress must be in [0, 1], got {progress}.")
+            schedule.append((progress, value))
+
+        if not schedule:
+            return None
+
+        logger.info_rank0(f"Enabled {config_key} schedule: {raw_schedule}")
+        return GapConfigValueSchedulerCallback(config_key, schedule)
+
+    def _resolve_configs(self, model: Any) -> list[Any]:
+        pending = [model]
+        seen: set[int] = set()
+        configs: list[Any] = []
+
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in seen:
+                continue
+
+            seen.add(id(current))
+            config = getattr(current, "config", None)
+            if config is not None and all(id(existing) != id(config) for existing in configs):
+                configs.append(config)
+
+            for attr in ("module", "model", "pretrained_model"):
+                nested = getattr(current, attr, None)
+                if nested is not None and id(nested) not in seen:
+                    pending.append(nested)
+
+        return configs
+
+    def _value_for_progress(self, progress: float) -> float:
+        value = self.schedule[0][1]
+        for start_progress, start_value in self.schedule:
+            if progress + 1e-12 >= start_progress:
+                value = start_value
+            else:
+                break
+        return value
+
+    def _apply_value(self, model: Any, state: "TrainerState") -> None:
+        max_steps = max(int(state.max_steps), 1)
+        progress = min(max(float(state.global_step) / float(max_steps), 0.0), 1.0)
+        value = self._value_for_progress(progress)
+
+        if self._last_value is not None and abs(self._last_value - value) < 1e-12:
+            return
+
+        for config in self._resolve_configs(model):
+            setattr(config, self.config_key, value)
+
+        self._last_value = value
+        logger.info_rank0(
+            f"Set {self.config_key} to "
+            f"{value:.4f} at step {state.global_step}/{state.max_steps} (progress={progress:.3f})."
+        )
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        self._apply_value(kwargs.get("model"), state)
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        self._apply_value(kwargs.get("model"), state)
+
+
 class LogCallback(TrainerCallback):
     r"""A callback for logging training and evaluation status."""
 

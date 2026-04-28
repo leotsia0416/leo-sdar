@@ -173,6 +173,7 @@ cache/
 config/
 saves/
 output/
+outputs/
 wandb/
 swanlog/
 generated_predictions.jsonl
@@ -188,3 +189,7 @@ assets/
 *.txt
 vendor/
 JetEngine/
+.codex
+*.vsix
+*.pdf
+artifacts/html/

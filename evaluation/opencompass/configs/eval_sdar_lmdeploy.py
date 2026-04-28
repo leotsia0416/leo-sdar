@@ -27,6 +27,13 @@ def _default_num_workers() -> int:
     return 1
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = _os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 def _format_threshold(threshold: float) -> str:
     return f'{threshold:.2f}'.replace('.', '_')
 
@@ -66,6 +73,9 @@ MAX_NEW_TOKENS = int(_os.environ.get('SDAR_MAX_NEW_TOKENS', '4096'))
 TOP_P = float(_os.environ.get('SDAR_TOP_P', '0.95'))
 TOP_K = int(_os.environ.get('SDAR_TOP_K', '50'))
 TEMPERATURE = float(_os.environ.get('SDAR_TEMPERATURE', '1.0'))
+DO_SAMPLE = _env_flag('SDAR_DO_SAMPLE', False)
+RANDOM_SEED_ENV = _os.environ.get('SDAR_LMDEPLOY_RANDOM_SEED', '').strip()
+RANDOM_SEED = int(RANDOM_SEED_ENV) if RANDOM_SEED_ENV else None
 
 if not _os.path.isdir(MODEL_PATH):
     raise FileNotFoundError(
@@ -258,6 +268,23 @@ dllm_unmasking_strategy = (
 model_abbr = (
     f'{MODEL_NAME}-b{BLOCK_LENGTH}-thr{_format_threshold(CONFIDENCE_THRESHOLD)}'
 )
+if DO_SAMPLE:
+    model_abbr += (
+        f'-sample-t{_format_threshold(TEMPERATURE)}'
+        f'-p{_format_threshold(TOP_P)}-k{TOP_K}'
+    )
+    if RANDOM_SEED is not None:
+        model_abbr += f'-s{RANDOM_SEED}'
+
+generation_kwargs = dict(
+    top_p=TOP_P,
+    top_k=TOP_K,
+    temperature=TEMPERATURE,
+    do_sample=DO_SAMPLE,
+    max_new_tokens=MAX_NEW_TOKENS,
+)
+if RANDOM_SEED is not None:
+    generation_kwargs['random_seed'] = RANDOM_SEED
 
 models = [
     dict(
@@ -265,13 +292,7 @@ models = [
         abbr=model_abbr,
         path=MODEL_PATH,
         run_cfg=dict(num_gpus=1),
-        generation_kwargs=dict(
-            top_p=TOP_P,
-            top_k=TOP_K,
-            temperature=TEMPERATURE,
-            do_sample=False,
-            max_new_tokens=MAX_NEW_TOKENS,
-        ),
+        generation_kwargs=generation_kwargs,
         model_kwargs=dict(
             tp=TP,
             dtype='float16',
@@ -308,6 +329,7 @@ eval = dict(
 work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar')
 
 del _default_num_workers
+del _env_flag
 del _format_threshold
 del _has_model_weights
 del _os

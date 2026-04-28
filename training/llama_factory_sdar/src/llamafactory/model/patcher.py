@@ -130,6 +130,11 @@ def patch_config(
         "gap_curriculum_min_coupling": model_args.gap_curriculum_min_coupling,
         "gap_grpo_loss_weight": model_args.gap_grpo_loss_weight,
         "gap_grpo_num_samples": model_args.gap_grpo_num_samples,
+        "gap_grpo_num_parents": model_args.gap_grpo_num_parents,
+        "gap_grpo_min_visible_blocks": model_args.gap_grpo_min_visible_blocks,
+        "gap_grpo_candidate_window_blocks": model_args.gap_grpo_candidate_window_blocks,
+        "gap_grpo_anchor_bias_power": model_args.gap_grpo_anchor_bias_power,
+        "gap_grpo_diverse_rollbacks": model_args.gap_grpo_diverse_rollbacks,
         "gap_grpo_clip_eps": model_args.gap_grpo_clip_eps,
         "gap_grpo_entropy_coef": model_args.gap_grpo_entropy_coef,
         "gap_grpo_remask_penalty": model_args.gap_grpo_remask_penalty,
@@ -138,6 +143,14 @@ def patch_config(
         "gap_grpo_dense_reward_weight": model_args.gap_grpo_dense_reward_weight,
         "gap_grpo_terminal_reward_weight": model_args.gap_grpo_terminal_reward_weight,
         "gap_grpo_format_reward_weight": model_args.gap_grpo_format_reward_weight,
+        "gap_grpo_mixed_terminal_filter": model_args.gap_grpo_mixed_terminal_filter,
+        "gap_grpo_correct_threshold": model_args.gap_grpo_correct_threshold,
+        "gap_grpo_min_correct_count": model_args.gap_grpo_min_correct_count,
+        "gap_grpo_max_correct_count": model_args.gap_grpo_max_correct_count,
+        "gap_grpo_rollout_temperature": model_args.gap_grpo_rollout_temperature,
+        "gap_grpo_initial_rollout_temperature": model_args.gap_grpo_initial_rollout_temperature,
+        "gap_grpo_rollout_top_k": model_args.gap_grpo_rollout_top_k,
+        "gap_grpo_rollout_top_p": model_args.gap_grpo_rollout_top_p,
     }
     for attr_name, attr_value in gap_optional_args.items():
         if attr_value is not None:

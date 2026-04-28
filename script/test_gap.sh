@@ -82,10 +82,13 @@ if [[ -z "${DEFAULT_MODEL_PATH}" ]]; then
 fi
 DEFAULT_BLOCK_LENGTH="${SDAR_BLOCK_LENGTH:-4}"
 DEFAULT_USE_REMASK="${SDAR_USE_REMASK:-true}"
-DEFAULT_REMASK_THRESHOLD="${SDAR_REMASK_THRESHOLD:-0.15}"
-DEFAULT_REMASK_START_RATIO="${SDAR_REMASK_START_RATIO:-0.5}"
-DEFAULT_REMASK_INTERVAL_BLOCKS="${SDAR_REMASK_INTERVAL_BLOCKS:-2}"
-DEFAULT_REMASK_WINDOW_BLOCKS="${SDAR_REMASK_WINDOW_BLOCKS:-3}"
+DEFAULT_REMASK_THRESHOLD="${SDAR_REMASK_THRESHOLD:-0.5}"
+DEFAULT_REMASK_START_RATIO="${SDAR_REMASK_START_RATIO:-0.0}"
+DEFAULT_REMASK_INTERVAL_BLOCKS="${SDAR_REMASK_INTERVAL_BLOCKS:-1}"
+DEFAULT_REMASK_WINDOW_BLOCKS="${SDAR_REMASK_WINDOW_BLOCKS:-5}"
+DEFAULT_REMASK_START_TOKENS="${SDAR_REMASK_START_TOKENS:-192}"
+DEFAULT_REMASK_PREFIX_GUARD_TOKENS="${SDAR_REMASK_PREFIX_GUARD_TOKENS:-192}"
+DEFAULT_REMASK_TAIL_GUARD_BLOCKS="${SDAR_REMASK_TAIL_GUARD_BLOCKS:-1}"
 DEFAULT_PROMPT_BUCKET_SIZE="${SDAR_PROMPT_BUCKET_SIZE:-32}"
 DEFAULT_TEMPERATURE="${SDAR_TEMPERATURE:-0.0}"
 DEFAULT_ACC_MONITOR_INTERVAL="${SDAR_ACC_MONITOR_INTERVAL:-30}"
@@ -99,12 +102,86 @@ DEFAULT_INFER_BATCH_SIZE_BASE="1"
 DEFAULT_MAX_NEW_TOKENS_REMASK="1536"
 DEFAULT_MAX_NEW_TOKENS_BASE="1536"
 
+model_config_default() {
+  local key="${1:?missing config key}"
+  local fallback="${2:?missing fallback value}"
+  local model_dir="${SDAR_MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
+  local config_path="${model_dir}/config.json"
+  if [[ ! -f "${config_path}" ]]; then
+    printf '%s\n' "${fallback}"
+    return 0
+  fi
+
+  "${EVAL_ENV_PREFIX}/bin/python" - "${config_path}" "${key}" "${fallback}" <<'PY'
+import json
+import sys
+
+config_path, key, fallback = sys.argv[1:4]
+try:
+    with open(config_path, 'r', encoding='utf-8') as f:
+        value = json.load(f).get(key)
+except Exception:
+    value = None
+
+print(fallback if value is None else value)
+PY
+}
+
+default_block_length() {
+  if [[ -n "${SDAR_BLOCK_LENGTH:-}" ]]; then
+    printf '%s\n' "${SDAR_BLOCK_LENGTH}"
+  else
+    model_config_default "block_size" "4"
+  fi
+}
+
+default_remask_threshold() {
+  if [[ -n "${SDAR_REMASK_THRESHOLD:-}" ]]; then
+    printf '%s\n' "${SDAR_REMASK_THRESHOLD}"
+  else
+    model_config_default "gap_remask_threshold" "0.5"
+  fi
+}
+
+default_remask_start_ratio() {
+  printf '%s\n' "${SDAR_REMASK_START_RATIO:-0.0}"
+}
+
+default_remask_interval_blocks() {
+  printf '%s\n' "${SDAR_REMASK_INTERVAL_BLOCKS:-1}"
+}
+
+default_remask_window_blocks() {
+  if [[ -n "${SDAR_REMASK_WINDOW_BLOCKS:-}" ]]; then
+    printf '%s\n' "${SDAR_REMASK_WINDOW_BLOCKS}"
+  else
+    model_config_default "gap_remask_window_blocks" "5"
+  fi
+}
+
+default_remask_start_tokens() {
+  printf '%s\n' "${SDAR_REMASK_START_TOKENS:-${DEFAULT_REMASK_START_TOKENS}}"
+}
+
+default_remask_prefix_guard_tokens() {
+  if [[ -n "${SDAR_REMASK_PREFIX_GUARD_TOKENS:-}" ]]; then
+    printf '%s\n' "${SDAR_REMASK_PREFIX_GUARD_TOKENS}"
+  else
+    default_remask_start_tokens
+  fi
+}
+
+default_remask_tail_guard_blocks() {
+  printf '%s\n' "${SDAR_REMASK_TAIL_GUARD_BLOCKS:-${DEFAULT_REMASK_TAIL_GUARD_BLOCKS}}"
+}
+
 use_remask_mode() {
   normalize_bool "${SDAR_USE_REMASK:-${DEFAULT_USE_REMASK}}"
 }
 
 remask_disabled_by_threshold() {
-  local threshold="${SDAR_REMASK_THRESHOLD:-${DEFAULT_REMASK_THRESHOLD}}"
+  local threshold
+  threshold="$(default_remask_threshold)"
   awk -v threshold="${threshold}" 'BEGIN { exit !(threshold >= 1.0) }'
 }
 
@@ -137,12 +214,24 @@ default_infer_batch_size() {
 }
 
 default_decode_backend() {
-  printf 'gap\n'
+  if [[ "$(normalize_bool "${SDAR_FAST_NOREMASK_BD3:-false}")" == "true" ]] && remask_disabled_by_threshold; then
+    printf 'bd3\n'
+    return 0
+  fi
+  if [[ "$(normalize_bool "${SDAR_FAST_NOREMASK_AR:-false}")" == "true" ]] && remask_disabled_by_threshold; then
+    printf 'ar\n'
+  else
+    printf 'gap\n'
+  fi
 }
 
 default_confidence_threshold() {
+  if [[ -n "${SDAR_CONFIDENCE_THRESHOLD:-}" ]]; then
+    printf '%s\n' "${SDAR_CONFIDENCE_THRESHOLD}"
+    return 0
+  fi
   if [[ "$(use_remask_mode)" == "true" ]]; then
-    printf '%s\n' "${DEFAULT_CONFIDENCE_THRESHOLD_REMASK}"
+    model_config_default "gap_rollout_confidence_threshold" "${DEFAULT_CONFIDENCE_THRESHOLD_REMASK}"
   else
     printf '%s\n' "${DEFAULT_CONFIDENCE_THRESHOLD_BASE}"
   fi
@@ -225,27 +314,39 @@ default_all_work_dir() {
 build_model_abbr() {
   local model_name="${1:?missing model name}"
   local confidence_threshold=""
+  local block_length=""
+  local remask_threshold=""
+  local remask_start_ratio=""
+  local remask_interval_blocks=""
+  local remask_window_blocks=""
+  local remask_start_tokens=""
+  local remask_prefix_guard_tokens=""
+  local remask_tail_guard_blocks=""
   confidence_threshold="${SDAR_CONFIDENCE_THRESHOLD:-}"
   if [[ -z "${confidence_threshold}" ]]; then
-    if [[ "$(use_remask_mode)" == "true" ]]; then
-      confidence_threshold="${DEFAULT_CONFIDENCE_THRESHOLD_REMASK}"
-    else
-      confidence_threshold="${DEFAULT_CONFIDENCE_THRESHOLD_BASE}"
-    fi
+    confidence_threshold="$(default_confidence_threshold)"
   fi
+  block_length="$(default_block_length)"
+  remask_threshold="$(default_remask_threshold)"
+  remask_start_ratio="$(default_remask_start_ratio)"
+  remask_interval_blocks="$(default_remask_interval_blocks)"
+  remask_window_blocks="$(default_remask_window_blocks)"
+  remask_start_tokens="$(default_remask_start_tokens)"
+  remask_prefix_guard_tokens="$(default_remask_prefix_guard_tokens)"
+  remask_tail_guard_blocks="$(default_remask_tail_guard_blocks)"
 
   if [[ "$(use_remask_mode)" == "true" ]]; then
     printf '%s-gap-b%s-thr%s-rt%s-t%s-rs%s\n' \
       "${model_name}" \
-      "${DEFAULT_BLOCK_LENGTH}" \
+      "${block_length}" \
       "$(format_threshold "${confidence_threshold}")" \
-      "$(format_threshold "${DEFAULT_REMASK_THRESHOLD}")" \
+      "$(format_threshold "${remask_threshold}")" \
       "$(format_threshold "${DEFAULT_TEMPERATURE}")" \
-      "$(format_threshold "${DEFAULT_REMASK_START_RATIO}")-ri${DEFAULT_REMASK_INTERVAL_BLOCKS}-rw${DEFAULT_REMASK_WINDOW_BLOCKS}"
+      "$(format_threshold "${remask_start_ratio}")-ri${remask_interval_blocks}-rw${remask_window_blocks}-rstk${remask_start_tokens}-pg${remask_prefix_guard_tokens}-tg${remask_tail_guard_blocks}"
   else
     printf '%s-b%s-thr%s\n' \
       "${model_name}" \
-      "${DEFAULT_BLOCK_LENGTH}" \
+      "${block_length}" \
       "$(format_threshold "${confidence_threshold}")"
   fi
 }
@@ -386,12 +487,15 @@ export SDAR_USE_REMASK="$(use_remask_mode)"
 export SDAR_EVAL_GPUS="${SDAR_EVAL_GPUS:-$(default_eval_gpus)}"
 export SDAR_INFER_BATCH_SIZE="${SDAR_INFER_BATCH_SIZE:-$(default_infer_batch_size)}"
 export SDAR_CONFIDENCE_THRESHOLD="${SDAR_CONFIDENCE_THRESHOLD:-$(default_confidence_threshold)}"
-export SDAR_REMASK_THRESHOLD="${SDAR_REMASK_THRESHOLD:-0.15}"
-export SDAR_REMASK_START_RATIO="${SDAR_REMASK_START_RATIO:-0.5}"
-export SDAR_REMASK_INTERVAL_BLOCKS="${SDAR_REMASK_INTERVAL_BLOCKS:-2}"
-export SDAR_REMASK_WINDOW_BLOCKS="${SDAR_REMASK_WINDOW_BLOCKS:-3}"
+export SDAR_REMASK_THRESHOLD="${SDAR_REMASK_THRESHOLD:-$(default_remask_threshold)}"
+export SDAR_REMASK_START_RATIO="${SDAR_REMASK_START_RATIO:-$(default_remask_start_ratio)}"
+export SDAR_REMASK_INTERVAL_BLOCKS="${SDAR_REMASK_INTERVAL_BLOCKS:-$(default_remask_interval_blocks)}"
+export SDAR_REMASK_WINDOW_BLOCKS="${SDAR_REMASK_WINDOW_BLOCKS:-$(default_remask_window_blocks)}"
+export SDAR_REMASK_START_TOKENS="${SDAR_REMASK_START_TOKENS:-$(default_remask_start_tokens)}"
+export SDAR_REMASK_PREFIX_GUARD_TOKENS="${SDAR_REMASK_PREFIX_GUARD_TOKENS:-$(default_remask_prefix_guard_tokens)}"
+export SDAR_REMASK_TAIL_GUARD_BLOCKS="${SDAR_REMASK_TAIL_GUARD_BLOCKS:-$(default_remask_tail_guard_blocks)}"
 export SDAR_PROMPT_BUCKET_SIZE="${SDAR_PROMPT_BUCKET_SIZE:-32}"
-export SDAR_BLOCK_LENGTH="${SDAR_BLOCK_LENGTH:-4}"
+export SDAR_BLOCK_LENGTH="${SDAR_BLOCK_LENGTH:-$(default_block_length)}"
 export SDAR_MAX_NEW_TOKENS="${SDAR_MAX_NEW_TOKENS:-$(default_max_new_tokens)}"
 export SDAR_TEMPERATURE="${SDAR_TEMPERATURE:-0.0}"
 export SDAR_TORCH_DTYPE="${SDAR_TORCH_DTYPE:-bfloat16}"
@@ -428,12 +532,22 @@ fi
 RECORD_REMASK="$(normalize_bool "${SDAR_RECORD_REMASK:-${DEFAULT_RECORD_REMASK}}")"
 RECORD_REMASK_EVENTS="$(normalize_bool "${SDAR_RECORD_REMASK_EVENTS:-false}")"
 LAUNCH_TS="$(date +%s)"
+DEFAULT_FORWARD_COUNT_PATH="${SDAR_WORK_DIR_ABS}/forward_counts_${LAUNCH_TS}.jsonl"
+DEFAULT_FORWARD_COUNT_SUMMARY_PATH="${SDAR_WORK_DIR_ABS}/forward_count_summary_${LAUNCH_TS}.txt"
 DEFAULT_REMASK_TRACE_PATH="${SDAR_WORK_DIR_ABS}/remask_trace_${LAUNCH_TS}.jsonl"
 DEFAULT_REMASK_EVENT_TRACE_PATH="${SDAR_WORK_DIR_ABS}/remask_event_trace_${LAUNCH_TS}.jsonl"
 DEFAULT_REMASK_SUMMARY_PATH="${SDAR_WORK_DIR_ABS}/remask_summary_${LAUNCH_TS}.txt"
+CUSTOM_FORWARD_COUNT_PATH="false"
+CUSTOM_FORWARD_COUNT_SUMMARY_PATH="false"
 CUSTOM_REMASK_TRACE_PATH="false"
 CUSTOM_REMASK_EVENT_TRACE_PATH="false"
 CUSTOM_REMASK_SUMMARY_PATH="false"
+if [[ -n "${SDAR_FORWARD_COUNT_PATH:-}" ]]; then
+  CUSTOM_FORWARD_COUNT_PATH="true"
+fi
+if [[ -n "${SDAR_FORWARD_COUNT_SUMMARY_PATH:-}" ]]; then
+  CUSTOM_FORWARD_COUNT_SUMMARY_PATH="true"
+fi
 if [[ -n "${SDAR_REMASK_TRACE_PATH:-}" ]]; then
   CUSTOM_REMASK_TRACE_PATH="true"
 fi
@@ -443,6 +557,9 @@ fi
 if [[ -n "${SDAR_REMASK_SUMMARY_PATH:-}" ]]; then
   CUSTOM_REMASK_SUMMARY_PATH="true"
 fi
+export SDAR_FORWARD_COUNT_PATH="${SDAR_FORWARD_COUNT_PATH:-${DEFAULT_FORWARD_COUNT_PATH}}"
+SDAR_FORWARD_COUNT_SUMMARY_PATH="${SDAR_FORWARD_COUNT_SUMMARY_PATH:-${DEFAULT_FORWARD_COUNT_SUMMARY_PATH}}"
+rm -f "${SDAR_FORWARD_COUNT_PATH}" "${SDAR_FORWARD_COUNT_SUMMARY_PATH}"
 if [[ "${RECORD_REMASK}" == "true" ]]; then
   export SDAR_REMASK_TRACE_PATH="${SDAR_REMASK_TRACE_PATH:-${DEFAULT_REMASK_TRACE_PATH}}"
   SDAR_REMASK_SUMMARY_PATH="${SDAR_REMASK_SUMMARY_PATH:-${DEFAULT_REMASK_SUMMARY_PATH}}"
@@ -712,6 +829,42 @@ print(summary_path)
 PY
 }
 
+write_forward_count_summary() {
+  local counts_path="$1"
+  local summary_path="$2"
+
+  mkdir -p "$(dirname "$summary_path")"
+  "${EVAL_ENV_PREFIX}/bin/python" - "$counts_path" "$summary_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+counts_path = Path(sys.argv[1])
+summary_path = Path(sys.argv[2])
+records = [json.loads(line) for line in counts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+total_forward_calls = sum(int(record.get("forward_calls", 0)) for record in records)
+
+lines = [
+    f"counts_path={counts_path}",
+    f"records={len(records)}",
+    f"total_forward_calls={total_forward_calls}",
+]
+for idx, record in enumerate(records):
+    lines.append(
+        "record_{} pid={} model_class={} forward_calls={} model_path={}".format(
+            idx,
+            record.get("pid"),
+            record.get("model_class"),
+            record.get("forward_calls"),
+            record.get("model_path"),
+        )
+    )
+
+summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(summary_path)
+PY
+}
+
 echo "Using model path: ${SDAR_MODEL_PATH}" >&2
 echo "Using eval config: ${SDAR_EVAL_CONFIG}" >&2
 echo "Use remask: ${SDAR_USE_REMASK}" >&2
@@ -719,7 +872,8 @@ echo "Decode backend: ${SDAR_DECODE_BACKEND}" >&2
 echo "Infer batch size: ${SDAR_INFER_BATCH_SIZE}" >&2
 echo "Eval workers: ${SDAR_EVAL_GPUS}" >&2
 echo "Prompt bucket size: ${SDAR_PROMPT_BUCKET_SIZE}" >&2
-echo "Remask cadence: start_ratio=${SDAR_REMASK_START_RATIO}, interval_blocks=${SDAR_REMASK_INTERVAL_BLOCKS}" >&2
+echo "Remask cadence: start_ratio=${SDAR_REMASK_START_RATIO}, start_tokens=${SDAR_REMASK_START_TOKENS}, interval_blocks=${SDAR_REMASK_INTERVAL_BLOCKS}" >&2
+echo "Remask guards: prefix_guard_tokens=${SDAR_REMASK_PREFIX_GUARD_TOKENS}, tail_guard_blocks=${SDAR_REMASK_TAIL_GUARD_BLOCKS}, window_blocks=${SDAR_REMASK_WINDOW_BLOCKS}" >&2
 echo "Running accuracy monitor interval: ${SDAR_ACC_MONITOR_INTERVAL}s" >&2
 if [[ -n "${SDAR_GSM8K_PATH:-}" ]]; then
   echo "GSM8K dataset path: ${SDAR_GSM8K_PATH}" >&2
@@ -742,6 +896,7 @@ fi
 if [[ "${RECORD_REMASK_EVENTS}" == "true" ]]; then
   echo "Recording remask event trace to ${SDAR_REMASK_EVENT_TRACE_PATH}" >&2
 fi
+echo "Recording forward counts to ${SDAR_FORWARD_COUNT_PATH}" >&2
 
 "${EVAL_ENV_PREFIX}/bin/python" run.py "${SDAR_EVAL_CONFIG}" &
 RUN_PID=$!
@@ -778,4 +933,17 @@ if [[ "${RECORD_REMASK_EVENTS}" == "true" && -f "${SDAR_REMASK_EVENT_TRACE_PATH}
     cp "${SDAR_REMASK_EVENT_TRACE_PATH}" "${EXP_DIR}/summary/remask_event_trace.jsonl"
   fi
   echo "Remask event trace written to ${SDAR_REMASK_EVENT_TRACE_PATH}" >&2
+fi
+if [[ -f "${SDAR_FORWARD_COUNT_PATH}" ]]; then
+  if [[ -n "${EXP_DIR}" && "${CUSTOM_FORWARD_COUNT_PATH}" != "true" ]]; then
+    cp "${SDAR_FORWARD_COUNT_PATH}" "${EXP_DIR}/summary/forward_counts.jsonl"
+  fi
+  if [[ -n "${EXP_DIR}" && "${CUSTOM_FORWARD_COUNT_SUMMARY_PATH}" != "true" ]]; then
+    SDAR_FORWARD_COUNT_SUMMARY_PATH="${EXP_DIR}/summary/forward_count_summary.txt"
+  fi
+  write_forward_count_summary "${SDAR_FORWARD_COUNT_PATH}" "${SDAR_FORWARD_COUNT_SUMMARY_PATH}" >/tmp/sdar_forward_count_summary_path.txt
+  FORWARD_COUNT_SUMMARY_WRITTEN_PATH="$(cat /tmp/sdar_forward_count_summary_path.txt)"
+  rm -f /tmp/sdar_forward_count_summary_path.txt
+  echo "Forward count summary written to ${FORWARD_COUNT_SUMMARY_WRITTEN_PATH}" >&2
+  sed -n '1,40p' "${FORWARD_COUNT_SUMMARY_WRITTEN_PATH}" >&2
 fi

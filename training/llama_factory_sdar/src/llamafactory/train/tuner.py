@@ -27,7 +27,7 @@ from ..extras.misc import infer_optim_dtype
 from ..extras.packages import is_ray_available
 from ..hparams import get_infer_args, get_ray_args, get_train_args, read_args
 from ..model import load_model, load_tokenizer
-from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback
+from .callbacks import GapConfigValueSchedulerCallback, GapRemaskThresholdSchedulerCallback, LogCallback, PissaConvertCallback, ReporterCallback
 from .dpo import run_dpo
 from .kto import run_kto
 from .ppo import run_ppo
@@ -55,6 +55,13 @@ def _training_function(config: dict[str, Any]) -> None:
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
 
     callbacks.append(LogCallback())
+    gap_remask_schedule_callback = GapRemaskThresholdSchedulerCallback.from_env()
+    if gap_remask_schedule_callback is not None:
+        callbacks.append(gap_remask_schedule_callback)
+    for scheduled_key in ("gap_remask_loss_weight", "gap_grpo_loss_weight"):
+        value_schedule_cb = GapConfigValueSchedulerCallback.from_env(scheduled_key)
+        if value_schedule_cb is not None:
+            callbacks.append(value_schedule_cb)
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())
 

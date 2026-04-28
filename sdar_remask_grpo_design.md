@@ -1,582 +1,593 @@
-# SDAR Remask GRPO 當前設計稿
+# From Schedules to Policies: Remasking for Inference-Consistent Discrete Diffusion
 
-## 文件目的
+## 數學化整理筆記
 
-這份文件只描述目前真正跑過、且已經驗證有用的 SDAR 1.7B remask + GRPO 作法。
+這份筆記整理的是一個核心主張：
 
-這裡的「當前作法」不是最早的設計假說，也不是所有 script 的歷史預設，而是目前主線實驗實際採用的 recipe，核心對應：
+> 若模型在訓練時學會了任意 corruption state 下的正確條件還原，那麼 inference 中反覆進行 remask-and-restore，仍可被視為一個一致的 posterior update 過程。
 
-- 訓練：`training_150446`
-- 最佳 no-remask baseline checkpoint：`checkpoint-140`
-- 主要 eval 路徑：
-  - LMDeploy no-remask
-  - HF gap decoder remask
 
----
-
-## 1. 當前已驗證有效的 recipe
-
-目前最有價值的設定不是從壞掉的 checkpoint 繼續修，而是：
-
-1. 從 base chat model 起訓
-2. hard MATH 訓練 prompt 直接加入 boxed 輸出要求
-3. 降低 diffusion / CE 權重，但不拿掉
-4. 補一個和實際 eval 對齊的 terminal correctness reward
-5. 另外補 format reward，避免被 `####` 資料格式帶偏
-
-這條線已經在 GSM8K 上超過原本 baseline：
-
-- baseline：約 `80.06`
-- `training_150446/checkpoint-140` 的 LMDeploy no-remask：約 `80.59`
-
-這件事的重要性在於：
-
-- 光靠之前的 SFT 沒有穩定超過 baseline
-- 目前這條 remask + GRPO 線至少已經出現正增益
+1. 為什麼這個觀點能回應 train--inference gap。
+2. 為什麼目前的 GRPO 版本仍然符合 **"From Schedules to Policies"** 這個題目。
+3. 為什麼「局部條件還原正確」和「全局最優」之間仍然要做區分。
 
 ---
 
-## 2. 目前實際訓練設定
+## 1. 問題背景：train--inference gap 在哪裡？
 
-### 2.1 資料
+想處理的 gap 可以分成兩點。
 
-目前主線 profile 是 `hard_math`。
+### 1.1 Corruption schedule 的不一致
 
-預設 raw hard MATH 來源仍是：
+訓練時，離散 diffusion / masked denoising 常採用接近「整條序列隨機破壞」的 corruption：
 
-- `math_train_hard_local`
+- 任意位置都可能被 mask。
+- 被破壞的位置分佈大致接近全序列平均。
 
-但真正用來訓練的 dataset 已改成：
+但 inference 時的 state 並不是這樣。實際上更常見的是：
 
-- `math_train_hard_boxed_prompt_local`
+- 左側 prefix 已有 context。
+- 中間有一小段模型自己生成的 visible window。
+- 真正待決策的內容主要集中在右側 suffix。
 
-也就是在 hard MATH 題目的 user prompt 後面，直接加上和 eval 對齊的 boxed 指令：
+因此，訓練所見 state distribution 與推理時實際遇到的 state distribution 並不一致。
 
-- step by step 但 concise
-- 最後答案放進 `\boxed{}`
-- boxed 後立刻停止
-- 不要輸出 boxed 後的補充文字
+### 1.2 Inference remasking 通常是 heuristic，而不是 learned policy
 
-這一步很重要。原因是目前部署與評測介面本來就要求 boxed 輸出；若訓練資料不帶這個 instruction，而 reward 又容忍 `####`，模型會被 MATH / GSM8K 原始資料格式帶偏。
+許多方法在 inference 時會加入一些 remask / rollback / revise 機制，例如：
 
-### 2.2 訓練 profile
+- confidence 低就重做
+- 固定 cadence 檢查
+- 某些位置分數過低就 rollback
 
-目前主線對應的有效 recipe 是：
+但這些規則常常只是 heuristic：
 
-- profile: `hard_math`
-- learning rate: `5e-6`
-- epochs: `3`
-- cutoff length: `2048`
-- packing: `false`
-- neat packing: `false`
+- 訓練時沒有明確學會「何時 remask」
+- 訓練時也沒有明確學會「該 remask 哪裡」
 
-### 2.3 初始化
+因此，第二個 gap 是：
 
-目前有效實驗不是從先前壞掉的 remask checkpoint 起訓，而是從 base model 起訓：
+> inference 會用到 remask，但 remask decision 本身並未被 train 進模型。
 
-- base model: `Models/SDAR-1.7B-Chat-`
+這也是 "From Schedules to Policies" 的核心動機：
 
-這點和早期做法不同。因為實驗上 base 明顯比某些中途 checkpoint 強，拿壞 checkpoint 當 anchor 只會把格式與生成習慣一起帶偏。
-
----
-
-## 3. 訓練 state 與 action 設計
-
-目前訓練語義仍然是 generated-window + single-remask branch。
-
-### 3.1 State 的三段結構
-
-對每個 sample，訓練 state 由三段構成：
-
-1. 正確 prefix  
-   前段使用 GT-visible token，當成穩定前綴。
-
-2. self-generated local window  
-   中段讓模型自己生成一段 visible window。
-
-3. masked suffix  
-   後段維持 masked，留給主 diffusion loss 與 reroll 後續解。
-
-這樣做的理由是：
-
-- 前綴要夠穩，避免整條 rollout 太亂
-- remask 又必須真的作用在模型自己生成的區域上
-
-### 3.2 Block 與 remask window
-
-目前 block 單位仍是：
-
-- `block_size = 4`
-
-真正允許 remask 的範圍仍是 generated window 的最後 `3` 個 blocks。
-
-也就是說，現在方法仍然不是在整條 answer 上隨便挑位置，而是在一個受控的 local generated window 內問：
-
-> 哪個位置最值得被打回 `[MASK]`？
-
-### 3.3 Branch 結構
-
-目前 GRPO 仍然不是完整 stochastic subset sampling。
-
-branch 結構是：
-
-- `branch 0`: baseline，不 remask
-- 其餘 branches：最多 `K-1` 條 single-remask branch
-- candidate 位置依 remask score 做 `top-k` 選擇
-
-目前預設：
-
-- `gap_grpo_num_samples = 8`
-
-所以實際 branch 數量是：
-
-- `1 + min(7, candidate_count)`
-
-### 3.4 Reroll 語義
-
-目前 single-remask branch 的語義仍是 block-level reroll：
-
-1. 先選到某個 candidate token
-2. 找出該位置所在的最早 block
-3. 將 generated visible 區間內 `block >= b` 的 token 全部 rollback 成 `[MASK]`
-4. 從該 block 起重新 rollout 到 terminal
-
-這裡不是只改一個 token，而是從被選中的 block 往後整段重解。
+- **schedule**：手工設計的 remask 規則
+- **policy**：依賴當前 state 做決策的 learned remask rule
 
 ---
 
-## 4. Reward 設計
+## 2. 基本形式化
 
-目前 reward 已經不是只有 dense + terminal 兩項，而是三項：
+固定一個 conditioning context $c$，例如題目或 prompt。
 
-1. dense reward
-2. terminal correctness reward
-3. terminal format reward
+令
 
-### 4.1 Dense reward
+- $x=(x_1,\dots,x_n)$ 為最終答案序列。
+- $p_{\mathrm{data}}(x\mid c)$ 為真實資料分佈。
 
-dense reward 還是：
+令 $m\in\{0,1\}^n$ 為一個 mask pattern：
 
+- $m_i=1$：第 $i$ 個 token 被 mask
+- $m_i=0$：第 $i$ 個 token 保留可見
+
+定義 corruption operator $\mathcal M_m(x)$
+表示將 $x$ 中所有 $m_i=1$ 的位置替換成 $[MASK]$ 後得到的 observation。
+
+若以 $x_m$ 表示 masked subset，$x_{\bar m}$ 表示 visible subset，
+則模型學習的條件分佈可記為
 $$
-R_{dense} = -L_{future}
-$$
-
-其中 $L_{future}$ 是 action 之後剩餘 masked 區域的 future diffusion loss。
-
-因此 dense reward 通常是負值：
-
-- 越接近 `0` 越好
-- 越負表示後續更難收尾
-
-### 4.2 Terminal correctness reward
-
-目前 terminal correctness reward 已經改成盡量對齊實際 eval。
-
-如果 target 是單純數值答案，抽取邏輯會優先從：
-
-1. `\boxed{}`
-2. `answer is ...`
-3. `</think>` 後半段
-4. 尾端數字
-
-這樣可避免把 `72` 和 `72.0` 當不同答案，也比較接近 GSM8K evaluator 實際吃的東西。
-
-如果 target 不是單純 numeric，而是較像 symbolic / math expression，仍回退到較保守的文字正規化比對，避免把 `\frac{1}{2}` 這類答案誤判成 `2`。
-
-### 4.3 Terminal format reward
-
-目前新增了 format reward，目的是把模型拉回 deployment contract，而不是只要求它數值正確。
-
-目前 format reward 主要獎懲：
-
-- 有 `\boxed{...}`：加分
-- boxed 後沒有尾巴：再加分
-- 出現 `####`：扣分
-- `<think>` / `</think>` 不配對：扣分
-
-最後 format reward 被 clamp 到 `[-1, 1]`。
-
-### 4.4 總 reward
-
-目前總 reward 為：
-
-$$
-R =
-w_d R_{dense}
-+
-w_t R_{terminal}
-+
-w_f R_{format}
--
-\alpha \cdot remask\_rate
+p_\theta(x_m \mid x_{\bar m}, c, m).
 $$
 
-目前主線有效設定是：
+這個式子可被理解為：
 
-- `gap_grpo_dense_reward_weight = 0.25`
-- `gap_grpo_terminal_reward_weight = 2.0`
-- `gap_grpo_format_reward_weight = 0.25`
-- `gap_grpo_remask_penalty = 0.0`
+> 在任意部分可見、任意部分被遮蔽的情況下，模型如何依條件分佈去還原被遮的部分。
+
+---
+
+## 3. 訓練時「學會任意 step 的還原」是什麼意思？
+
+在 diffusion 語境下，常見說法是：
+
+> 若模型對所有 noise levels 都學會正確的 reverse conditional，則將這些 reverse steps 串起來即可得到正確的 sampling process。
+
+在 remask 觀點下，對應的命題是：
+
+> 若模型對所有 mask patterns 都學會正確的 conditional posterior，則 inference 中任意有限次的 remask-and-restore 都不會偏離正確目標分佈。
+
+更形式化地說，若對所有 $m$ 都有
+$$
+p_\theta(x_m \mid x_{\bar m}, c, m)=
+p_{\mathrm{data}}(x_m \mid x_{\bar m}, c),
+$$
+則模型在任意 corruption state 下做的重建都是 Bayes-optimal reconstruction。
+
+---
+
+## 4. 單次 remask update 的正確性
+
+固定 context $c$，定義目標分佈
+$$
+\pi(x):=p_{\mathrm{data}}(x\mid c).
+$$
+
+對任意 mask pattern $m$，定義 transition kernel
+$$
+K_m(x'\mid x)
+:=
+\mathbb 1\{x'_{\bar m}=x_{\bar m}\}
+\, p_{\mathrm{data}}(x'_m \mid x_{\bar m}, c).
+$$
+
+這表示：
+
+- 未被 remask 的位置保持不變
+- 被 remask 的位置依真實條件 posterior 重新抽樣
+
+### Theorem 1
+對任意 mask pattern $m$，$\pi$ 對 $K_m$ 是 invariant 的，即
+$$
+\sum_x \pi(x) K_m(x'\mid x)=\pi(x').
+$$
+
+### Proof
+由定義，
+$$
+\sum_x \pi(x) K_m(x'\mid x)=
+\sum_{x_m} \pi(x_m,x'_{\bar m})
+\, p_{\mathrm{data}}(x'_m\mid x'_{\bar m}, c).
+$$
+
+而
+$$
+\sum_{x_m} \pi(x_m,x'_{\bar m})=\pi(x'_{\bar m}).
+$$
+
+因此
+$$
+\sum_x \pi(x) K_m(x'\mid x)=
+\pi(x'_{\bar m})\, p_{\mathrm{data}}(x'_m\mid x'_{\bar m}, c)=
+\pi(x').
+$$
+
+證畢。
+
+### 解讀
+這個 theorem 的含義是：
+
+> 只要一次 remask + reconstruction 使用的是真實 conditional posterior，那麼這一步更新本身不會破壞目標分佈。
+
+---
+
+## 5. 多次 remask inference 的正確性
+
+若 inference 中依序使用一串 mask patterns
+$$
+m_1,m_2,\dots,m_T,
+$$
+其對應 kernels 為
+$$
+K_{m_1},K_{m_2},\dots,K_{m_T},
+$$
+則複合 kernel
+$$
+K:=K_{m_T}\circ\cdots\circ K_{m_1}
+$$
+仍以 $\pi$ 為 invariant distribution。
+
+### Corollary 1
+若每一步 remask update 都使用正確的 conditional posterior，則任意有限次 repeated remask 的整體 transition 仍 preserves
+$$
+p_{\mathrm{data}}(\cdot\mid c).
+$$
+
+### 解讀
+局部條件還原正確 $\Rightarrow$ 多步 remask 整體正確。
+
+也就是說，若模型真的學會了任意 step、任意 mask pattern 下的正確 conditional reconstruction，那 inference 時不論進行幾次 remask，本質上都只是反覆做合法的 posterior update。
+
+---
+
+## 6. 這和標準 diffusion 理論的對應
+
+標準 diffusion 會寫成：
+
+- forward process：
+$$
+q(x_t\mid x_{t-1}),\qquad q(x_t\mid x_0)
+$$
+- reverse model：
+$$
+p_\theta(x_{t-1}\mid x_t,c)
+$$
+
+若對所有 $t$ 都有
+$$
+p_\theta(x_{t-1}\mid x_t,c)=q(x_{t-1}\mid x_t,c),
+$$
+則 reverse chain
+$$
+x_T\to x_{T-1}\to\cdots\to x_0
+$$
+會精確生成 $p_{\mathrm{data}}(x_0\mid c)$。
+
+remask 觀點只是把「固定時間步的 reverse」推廣成「任意 subset 的局部再加噪與再還原」：
+
+- diffusion：沿固定 schedule 還原
+- remasking：允許依當前 state 決定哪個 subset 需要重新還原
+
+這也是為什麼題目會從 **schedules** 走向 **policies**。
+
+---
+
+## 7. 這個結論解決的是什麼？
+
+上面證明的是：
+
+> repeated remask 在**分佈層面**的正確性
 
 也就是：
 
-- correctness 還是主導項
-- dense reward 負責 shaping
-- format reward 負責不讓模型被 `####` 與拖尾格式帶走
+- 多次 remask 不會把系統帶離正確 target distribution
+- inference 可被解讀為一連串 posterior-preserving transitions
+
+這很重要，但它還不是「全局最優」的命題。
 
 ---
 
-## 5. 總 loss 與目前權重平衡
+## 8. 為什麼這還不等於全局最優？
 
-目前總 loss 仍由三塊組成：
+要非常明確地區分兩件事。
 
+### 8.1 Distributional correctness
+這是上面 theorem 已證明的內容：
 $$
-L_{total}
+\pi \text{ is invariant under repeated remask updates.}
+$$
+
+### 8.2 Pathwise global optimality
+這是另一個更強的主張：
+
+> inference 時每一步都選當前最值得 remask 的 action，最後整條 remask schedule 是全局最優。
+
+這個命題不能單靠「條件還原正確」直接推出。
+
+原因是單步最優不必然等於多步全局最優。存在典型反例：
+
+- action $A$ 現在看起來收益最高
+- action $B$ 當下收益較小
+- 但先做 $B$ 可能打開未來更大的收益
+
+因此要主張全局最優，還必須再加上結構假設，例如：
+
+- reward 的可加性
+- action 之間沒有強互補作用
+- Bellman optimality 可成立
+- 或 global objective 對 remask set 具有 submodularity
+
+---
+
+## 9. 從 schedules 到 policies：policy 版本的數學化
+
+為了描述 inference 中的多次 remask，可定義一個序列決策問題。
+
+### 9.1 State
+令 state $s$ 表示當前生成狀態，例如：
+$$
+s=(c, x_{\mathrm{prefix}}, x_{\mathrm{window}}, [MASK]_{\mathrm{suffix}}, b),
+$$
+其中：
+
+- $c$：題目 / prompt
+- $x_{\mathrm{prefix}}$：已穩定的 prefix
+- $x_{\mathrm{window}}$：當前模型自己生成的 local visible window
+- $[MASK]_{\mathrm{suffix}}$：待補完的 suffix
+- $b$：可選的 remask budget 或其他控制變數
+
+### 9.2 Action
+令 action $a$ 為：
+$$
+a\in\{\varnothing\}\cup\{\text{rollback from block }j\}.
+$$
+
+也就是：
+
+- $\varnothing$：不 remask
+- 從某個 block $j$ 開始 rollback，然後 reroll 到 terminal
+
+### 9.3 Return
+令總回報為
+$$
+R=\sum_{t=0}^{T-1} r_t,
+$$
+或更貼近實作地寫成
+$$
+R = w_d R_{\mathrm{dense}} + w_t R_{\mathrm{terminal}} + w_f R_{\mathrm{format}} - \alpha\,\mathrm{remask\_rate}.
+$$
+
+這時即可定義 action value
+$$
+Q^\pi(s,a)=\mathbb E[R\mid s_t=s,a_t=a,\pi].
+$$
+
+若訓練中 single-remask rollout branch 給出的 return 可以視為對 $Q(s,a)$ 的估計，
+那麼 inference 時反覆選擇
+$$
+a_t=\arg\max_a Q(s_t,a)
+$$
+就對應於一個 state-dependent remask policy。
+
+這正是：
+
+> 從手工 schedule 設計，轉向 learned remask policy。
+
+---
+
+## 10. GRPO 在這個框架下扮演什麼角色？
+
+目前這條線更清楚的寫法，應該是：
+
+> 先寫一般的 GRPO / PPO-style 公式，再把每個符號直接落到目前的 remask branch 流程。
+
+### 10.1 一般 GRPO 形式
+
+對某個 state $s$，令同一個 group 內可比較的 actions 為
+$$
+G(s)=\{a_0,a_1,\dots,a_K\}.
+$$
+
+一般的 PPO-style GRPO loss 可寫成
+$$
+\mathcal L_{\mathrm{GRPO}}(s)
 =
-w_{diff} L_{diffusion}
-+
-\lambda_{rm} L_{remask\_bce}
-+
-\lambda_{grpo} L_{grpo}
+-\frac{1}{K}\sum_{k=1}^{K}
+\min\Big(
+r_k \hat A_k,\,
+\operatorname{clip}(r_k,1-\epsilon,1+\epsilon)\hat A_k
+\Big)
+-\beta\,\mathcal H(\pi_\theta(\cdot\mid s)),
+$$
+其中
+$$
+r_k
+=
+\exp\big(
+\log \pi_\theta(a_k\mid s)
+-\log \pi_{\theta_{\mathrm{old}}}(a_k\mid s)
+\big),
+$$
+且
+$$
+\hat A_k
+=
+\frac{R_k-\bar R}{\operatorname{std}(R)+\varepsilon},
+\qquad
+\bar R=\frac{1}{K+1}\sum_{j=0}^{K}R_j.
 $$
 
-目前主線有效設定是：
+也就是說：
 
-- `gap_diffusion_loss_weight = 0.5`
-- `gap_remask_loss_weight = 0.05`
-- `gap_grpo_loss_weight = 0.1`
+- 同一個 group 先產生一批 actions 的 returns $R_0,\dots,R_K$
+- 再做 group-normalized advantage
+- 最後只對真正要更新 policy 的 actions 做 clipped policy improvement
 
-這裡的重點不是把 CE 拿掉，而是：
+### 10.2 把公式代入目前的 remask 流程
 
-- 保留 diffusion / CE 當 anchor
-- 但把它降權，避免被資料格式直接帶走
-- 同時讓 GRPO reward 開始真正影響 remask policy
+在我們的實作裡，state $s$ 不是抽象的 token 狀態，而是「當前 generated window 的 remask 決策狀態」，可粗略寫成
+$$
+s=(c, x_{\mathrm{clean}}, x_{\mathrm{noisy}}, m_{\mathrm{cand}}, \text{block ids}, \text{visible mask}),
+$$
+其中包含：
 
-目前不建議直接把 CE 歸零。原因是現在 GRPO 優化的核心仍然是 remask branch policy，不是把整個 decoder 直接改造成純 RL。
+- 題目 / prompt
+- 目前 clean/noisy 的 answer 狀態
+- 可被 remask 的 candidate positions
+- 各 token 所屬 block
+- 目前 generated visible 區間
+
+接著對每個 candidate position $i$，remask head 給出 logit $z_i$，令
+$$
+p_i=\sigma(z_i).
+$$
+把 candidates 依 $z_i$ 由高到低排序後，得到
+$$
+i_{(1)},i_{(2)},\dots,i_{(N)}.
+$$
+
+目前的 action group 不是一般 PPO 裡抽象的一組 sampled actions，而是明確構造成
+$$
+G(s)=\{a_0,a_1,\dots,a_K\},
+$$
+其中：
+
+- $a_0$：baseline，不 remask
+- $a_k$：remask top-$k$ candidate positions，並從其中最早被選中的 block 開始 rollback，之後 reroll 到 terminal
+
+所以目前 action 的語義其實是：
+
+> 在當前 generated window 下，選擇一個 cumulative remask set，並從最早被打回的 block 起整段重解。
+
+### 10.3 目前 branch log-prob 怎麼寫
+
+令 branch 0 對應 no-remask，則
+$$
+\log \pi_\theta(a_0\mid s)=\sum_{i=1}^{N}\log(1-p_i).
+$$
+
+對於第 $k$ 條 remask branch，
+$$
+\log \pi_\theta(a_k\mid s)
+=
+\sum_{j=1}^{k}\log p_{i_{(j)}}
++
+\sum_{j=k+1}^{N}\log(1-p_{i_{(j)}}).
+$$
+
+這正對應目前 code 裡的 cumulative top-$k$ branch construction：
+
+- branch 0：全部 keep
+- branch 1：只 remask 排名第 1 的位置
+- branch 2：remask 排名前 2 的位置
+- ...
+- branch $K$：remask 排名前 $K$ 的位置
+
+### 10.4 目前 branch reward 怎麼寫
+
+對每條 branch $a_k$，先真的 rollout / reroll 到 terminal，然後用目前實作中的 reward 組合得到
+$$
+R_k
+=
+w_d R^{(k)}_{\mathrm{dense}}
++
+w_t R^{(k)}_{\mathrm{terminal}}
++
+w_f R^{(k)}_{\mathrm{format}}
+-\alpha\,\rho_k,
+$$
+其中：
+
+- $R^{(k)}_{\mathrm{dense}}$：future diffusion shaping reward
+- $R^{(k)}_{\mathrm{terminal}}$：最終答案正確性 reward
+- $R^{(k)}_{\mathrm{format}}$：格式 reward
+- $\rho_k$：該 branch 的 remask rate
+
+因此 advantage 不是抽象的 RL return，而是：
+$$
+\hat A_k
+=
+\frac{R_k-\bar R}{\operatorname{std}(R)+\varepsilon}.
+$$
+
+也就是「這條 remask rollback branch，相對於同一組其他 branches，到底好多少」。
+
+### 10.5 實際更新的是哪一部分
+
+在目前實作裡，baseline branch $a_0$ 的角色是：
+
+- 提供 no-remask 對照
+- 參與 group reward normalization
+- 不直接放進 policy gradient 的求和項
+
+真正進入 PPO-style policy term 的，是 remask branches $k\ge 1$：
+$$
+\mathcal L_{\mathrm{GRPO}}^{\mathrm{remask}}(s)
+=
+-\frac{1}{K}\sum_{k=1}^{K}
+\min\Big(
+r_k \hat A_k,\,
+\operatorname{clip}(r_k,1-\epsilon,1+\epsilon)\hat A_k
+\Big)
+-\beta\,\mathcal H(\pi_\theta(\cdot\mid s)).
+$$
+
+所以從目前 remask 流程來看，GRPO 真正在學的不是一般性的「下一 token policy」，而是
+$$
+\pi_\theta(\text{which blocks should be rerolled}\mid \text{current generated window}).
+$$
+
+這樣寫之後，整個 GRPO 的角色就很明確：
+
+- baseline / remask branches 對應的是一組明確的 rollback actions
+- reward 來自 reroll 後的 dense + terminal + format 回報
+- policy update 在學的是「哪種 remask rollback 比 no-remask 更值得」
+
+因此更精確地說，GRPO 是：
+
+> a policy-learning instantiation of inference-consistent remasking, specialized to our remask-and-reroll workflow.
 
 ---
 
-## 6. 為什麼這版比舊版更合理
+## 11. 什麼時候可以進一步談全局保證？
 
-相對於早期版本，這次真正改對的點是：
+若想把主張從「分佈正確」推進到「多次 remask 的全局優化」，通常要再加入額外假設。
 
-### 6.1 訓練 prompt 與 eval prompt 對齊
+### 11.1 Bellman / MDP 版本
+若 state 是 Markov sufficient，且 future return 只由當前 state 與 action 決定，
+且訓練得到的是正確的 $Q(s,a)$，
+則 repeated remask 可被視為標準序列決策中的 optimal policy。
 
-以前 base model 會 boxed，多半是因為它本來 instruction following 不錯；後續 hard-math 訓練如果不顯式要求 boxed，反而容易把這個習慣洗掉。
+### 11.2 Submodular / greedy 版本
+若把一整次 inference 中發生的 remask events 視為一個集合 $S$，並定義全局目標$J(S)$
+若 $J$ 滿足：
 
-現在 hard MATH 訓練 prompt 已經直接加了 boxed instruction，所以模型不是只在 eval 才第一次看到這個要求。
+- 單調性
+- 遞減報酬（submodularity，或更強的 adaptive submodularity）
 
-### 6.2 reward 與實際 eval 更對齊
+則 greedy 地每次選 marginal gain 最大的 remask，會有經典近似保證：
+$$
+J(S_{\mathrm{greedy}})\ge (1-1/e)\,J(S^\star).
+$$
 
-以前 terminal reward 太容易接受 `####` 或尾端數字，對 boxed 的偏好不夠明確。
-
-現在至少分成兩件事：
-
-- correctness 是否對
-- 格式是否符合 contract
-
-### 6.3 base 比壞 checkpoint 更適合當起點
-
-實驗上 base 比某些舊 checkpoint 更穩。
-
-因此目前做法已經不把「舊 checkpoint 分佈」當要維持的東西，而是直接從 base 出發。
+這條路通常比 exact global optimum 更實際，也更容易成立。
 
 ---
 
-## 7. 目前 eval 路徑的角色分工
+## 12. 因此，最穩的理論主張是什麼？
 
-### 7.1 LMDeploy no-remask
+我建議將主張分成兩層。
 
-`test_gap.sh` 在：
+### Claim A：生成正確性
+若模型學會任意 corruption state 下的正確 conditional posterior，則任意有限次 repeated remask inference 都 preserves 正確 target distribution。
 
-- `SDAR_USE_REMASK=false`
+### Claim B：優化正確性
+若再加入額外結構假設，例如：
 
-時，實際會走 LMDeploy config。
+- Markov sufficiency
+- Bellman optimality
+- 或 submodular global objective
 
-這條路徑目前的角色是：
+則 repeated remask policy 可進一步擁有全局最優或近似全局最優保證。
 
-- deployment-style baseline
-- 快速、穩定、接近實際部署的 no-remask 成績
-
-目前最佳例子：
-
-- `training_150446/checkpoint-140`
-- LMDeploy no-remask：約 `80.59`
-
-### 7.2 HF gap remask
-
-`test_gap.sh` 在：
-
-- `SDAR_USE_REMASK=true`
-
-時，實際會走你自己寫的 HF gap decoder。
-
-這條路徑目前的角色是：
-
-- 驗證 remask policy 是否有用
-- 做 method analysis
-- 研究觸發時機、rollback 節奏與 remask score
-
-同一個 `checkpoint-140`，HF gap 預設 remask 也跑到約 `80.59`。
-
-### 7.3 HF gap no-remask 的 caveat
-
-目前如果在 HF gap 路徑用：
-
-- `SDAR_USE_REMASK=true`
-- `SDAR_REMASK_THRESHOLD=1.0`
-
-把 remask 關掉，這不是完全公平的「同路徑、只把 rollback 拿掉」控制組。
-
-原因是目前 code 在 threshold >= 1.0 時，還會把：
-
-- `gap_enabled = False`
-- `remask_window_blocks = 1`
-
-一起改掉。
-
-這代表這條 no-remask control 不只是「不 remask」，而是連 window / cache commit 節奏都變了。
-
-實驗上同一個 `checkpoint-140`：
-
-- HF gap remask：約 `80.59`
-- HF gap threshold=1.0 pseudo-no-remask：約 `79.15`
-
-所以這個 `79.15` 不能直接解讀成「你的 decoder 完全不行」，而要理解成：
-
-- 目前 pseudo-no-remask control 本身就帶了額外路徑改變
+這樣的寫法既保守，又有數學力度。
 
 ---
 
-## 8. 當前最好怎麼解讀分數
+## 13. 回到題目：為什麼這仍然是 “From Schedules to Policies”？
 
-目前比較合理的分工是：
+題目的核心不是「完全消除所有 train--inference gap」，而是：
 
-1. `LMDeploy no-remask`
-   看 deployment baseline
+1. 承認固定 schedule 無法充分描述 inference state distribution。
+2. 承認 heuristic remask 無法充分反映最終任務目標。
+3. 因此將 remasking 改寫成 state-dependent policy learning 問題。
 
-2. `HF gap remask`
-   看你的方法本身有沒有價值
+在這個意義下，GRPO 版本不但沒有背離題目，反而讓題目更成立：
 
-3. `HF gap threshold=1.0`
-   只能當近似 control，不能當完全公平的 no-remask 等價路徑
+- **From schedules**：不再只靠手工 cadence / threshold / rollback 規則
+- **To policies**：改成依當前 state 評估不同 remask actions 的價值
 
-也就是說，目前最該看的不是：
+只是必須誠實補充：
 
-> HF gap pseudo-no-remask 能不能直接打贏 LMDeploy
-
-而是：
-
-> 同一個 checkpoint 下，HF gap remask 能不能在你自己的 decoder 上帶來幫助
+> 目前方法不只是在做 inference-consistency，也同時做了 reward-aligned policy learning。
 
 ---
 
-## 9. 目前 remask trigger 的語義
+## 14. 一句話總結
 
-目前 eval 端是否觸發 remask，要經過兩層判斷：
+最濃縮的數學版主張可以寫成：
 
-### 9.1 先看 cadence / 時機
+$$
+\forall m,\quad
+p_\theta(x_m\mid x_{\bar m},c,m)=p_{\mathrm{data}}(x_m\mid x_{\bar m},c)
+\Longrightarrow
+K_m \text{ preserves } p_{\mathrm{data}}(\cdot\mid c).
+$$
 
-只有在以下條件成立時才會檢查 remask：
+因此對任意 remask schedule $(m_1,\dots,m_T)$，其複合 kernel
+$$
+K_{m_T}\circ\cdots\circ K_{m_1}
+$$
+仍 preserves $p_{\mathrm{data}}(\cdot\mid c)$。
 
-- 已經進到 `first_remask_block` 之後
-- `remask_progress >= remask_start_ratio`
-- 命中 `remask_interval_blocks`
+也就是：
 
-### 9.2 再看 remask head 分數
+> **局部條件還原正確 $\Rightarrow$ 多步 remask 推理整體正確。**
 
-進到可檢查時，會對 window 裡 candidate token 算：
-
-- `gap_remask_head(hidden_state)`
-- `sigmoid`
-- 取最佳 candidate 的 `best_score`
-
-只有當：
-
-- `best_score >= remask_threshold`
-
-才真的觸發 rollback。
-
-### 9.3 rollback 仍是 block-level
-
-目前觸發後，仍然不是只改一個 token，而是從該 token 所在 block 往後 rollback。
-
-在 `window=3`、`block=4` 的情況下，單次 rollback 規模其實沒有大到離譜；真正看起來極端的是某些題會連續觸發很多次。
+而若想進一步聲稱 repeated remask 對最終 reward 是全局最優，則必須再引入額外的 optimal control / Bellman / submodular 類假設。
 
 ---
 
-## 10. 目前如何細看 remask 時機與頻率
+## 15. 可直接放進論文的表述
 
-舊版 trace 只會記：
+可以用下列版本作為 paper-style summary：
 
-- `steps_with_remask`
-- `total_remasked_tokens`
-
-這太粗，無法回答：
-
-- 第一個 check 在哪個 block
-- 第一個 trigger 在哪個 block
-- 分數離 threshold 差多少
-- 哪些題是一直被檢但從不觸發
-- 哪些題是從中段開始連續觸發 97 次
-
-因此目前已補了 event-level trace。
-
-現在可選擇額外記錄：
-
-- `generated_blocks`
-- `remask_progress`
-- `candidate_count`
-- `best_score`
-- `score_margin`
-- `selected_block`
-- `rollback_start`
-- `triggered`
-- `remasked_tokens`
-
-建議分析順序：
-
-1. 看 `first_check_block / first_trigger_block`
-   判斷是不是開始得太晚
-
-2. 看 `best_score` 與 `score_margin`
-   判斷是 threshold 太高，還是 head 根本沒把高風險位置拉開
-
-3. 看 `checks_per_example / triggers_per_example`
-   判斷是不是 cadence 太密，導致少數題反覆介入
-
-4. 看 `remasked_tokens_triggered_checks`
-   判斷 rollback 粒度是否過重
-
----
-
-## 11. 目前最重要的觀察指標
-
-### 11.1 訓練期
-
-目前至少要看：
-
-- `loss`
-- `diffusion_loss`
-- `weighted_diffusion_loss`
-- `remask_loss`
-- `grpo_loss`
-- `grpo_reward`
-- `grpo_dense_reward`
-- `grpo_terminal_reward`
-- `grpo_format_reward`
-- `grpo_reward_std`
-- `grpo_branch_count`
-- `candidate_tokens`
-- `remask_pred_rate`
-
-### 11.2 解讀方式
-
-- `weighted_diffusion_loss` 是否真的反映降權後的 CE
-- `grpo_terminal_reward` 是否有往上走
-- `grpo_format_reward` 是否從負值往 0 靠近
-- `remask_pred_rate` 是否仍遠高於真實 positive rate
-- `grpo_reward_std` 是否太小，導致 group 內沒有效學訊號
-
-目前從有效 run 來看：
-
-- boxed prompt + format reward 確實能把格式拉回來
-- 真正剩下的瓶頸多半是 correctness，不是格式
-
----
-
-## 12. 目前已知的實驗結論
-
-### 12.1 這條方法不是假的
-
-目前已經有 checkpoint 超過 baseline，因此不能再把整條 remask + GRPO 線當成無效方向。
-
-### 12.2 `LMDeploy wrong` 不等於 hard set
-
-從 LMDeploy no-remask 挑出的錯題，換成 HF gap decoder no-remask，仍能救回一部分。
-
-這代表：
-
-- `LMDeploy wrong`
-
-其實是：
-
-- 真難題
-- 路徑敏感題
-
-的混合，不是純 hard set。
-
-### 12.3 目前 remask 觸發仍偏 sparse
-
-全量 GSM8K 上，預設 remask 並不是大量觸發，而是只在少數題介入。
-
-所以目前重點還不是「每題都要 remask」，而是：
-
-- 哪些題型值得介入
-- 介入時機是不是太晚
-- 介入後是否真的修到 correctness
-
----
-
-## 13. 目前最重要的限制
-
-### 13.1 branch 採樣仍然偏 deterministic
-
-現在 branch 仍是：
-
-- baseline
-- top-k single-remask
-
-不是真正 stochastic multi-action GRPO。
-
-### 13.2 沒有 explicit KL anchor
-
-目前沒有像 PPO ref-model 那樣的 explicit KL 去拉回 base distribution。
-
-當前主要穩定器仍是：
-
-- diffusion / CE
-- remask BCE
-
-### 13.3 HF gap no-remask control 仍不夠公平
-
-目前 threshold >= 1.0 會順便改變 window / commit 行為。
-
-若要做真正公平的 no-remask ablation，應該改成：
-
-- 保留 `window_blocks=3`
-- 只禁用 rollback branch
-
-### 13.4 correctness 仍是主要瓶頸
-
-目前格式問題已經比以前明顯好很多。
-
-接下來最可能帶來增益的，不是再多修 boxed，而是提升 reasoning correctness。
-
----
-
-## 14. 目前建議的工作順序
-
-如果要沿這條線繼續做，我會建議：
-
-1. 保留目前 recipe 作為主線
-   base 起訓 + boxed prompt + diffusion 降權 + format reward
-
-2. 把 HF gap 的公平 no-remask control 補好
-
-3. 用 event trace 去分析真正的 remask trigger timing
-
-4. 若要再往上推，再考慮：
-   - explicit KL to base
-   - 更合理的 branch sampling
-   - correctness-oriented reward 強化
-
----
-
-## 15. 一句話總結
-
-目前這版方法的定位很清楚：
-
-> 用 base chat model 當穩定起點，在 boxed-aligned 的 hard MATH 上做 generated-window remask policy learning；主 loss 仍是 diffusion，但透過 eval-aligned correctness reward 與 format reward，讓模型學會哪些 local generated positions 值得 rollback，並且不要被原始資料的 `####` 格式帶偏。
-
-這就是目前真正有效、而且已經在 GSM8K 上產生正向訊號的作法。
+> We reinterpret remasking as a state-dependent posterior update rather than a hand-crafted inference heuristic. If the model learns the correct conditional posterior for arbitrary corruption states, then each remask-and-restore operation defines a posterior-preserving transition, and any finite sequence of such transitions remains consistent with the target data distribution. This establishes the distributional correctness of repeated remasking. Beyond this, when remasking decisions are optimized using rollout-based relative returns, remasking becomes a learned policy rather than a fixed schedule.

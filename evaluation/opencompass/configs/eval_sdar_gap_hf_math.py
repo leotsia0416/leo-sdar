@@ -1,9 +1,4 @@
-from opencompass.datasets import (
-    GSM8KDataset,
-    MATHEvaluator,
-    gsm8k_dataset_postprocess,
-    math_postprocess_sdar,
-)
+from opencompass.datasets import MATHDataset, MATHEvaluator, math_postprocess_sdar
 from opencompass.models import SDARGapwithChatTemplate
 from opencompass.openicl.icl_inferencer import GenInferencer
 from opencompass.openicl.icl_prompt_template import PromptTemplate
@@ -58,10 +53,8 @@ MODEL_NAME = _os.environ.get('SDAR_MODEL_NAME', 'SDAR-1.7B-Chat-')
 MODEL_PATH = _os.path.abspath(
     _os.environ.get('SDAR_MODEL_PATH', _os.path.join(MODEL_ROOT, MODEL_NAME))
 )
-GSM8K_PATH = _os.path.abspath(
-    _os.environ.get('SDAR_GSM8K_PATH', '/work/leotsia0416/datasets/gsm8k')
-)
-GSM8K_ABBR = _os.environ.get('SDAR_GSM8K_ABBR', 'gsm8k')
+MATH_PATH = _os.environ.get('SDAR_MATH_PATH', 'opencompass/math')
+MATH_ABBR = _os.environ.get('SDAR_MATH_ABBR', 'math')
 
 if not _os.path.isdir(MODEL_PATH):
     raise FileNotFoundError(
@@ -72,10 +65,6 @@ if not _os.path.exists(_os.path.join(MODEL_PATH, 'config.json')):
     raise FileNotFoundError(f'SDAR model path is missing config.json: {MODEL_PATH}.')
 if not _has_model_weights(MODEL_PATH):
     raise FileNotFoundError(f'SDAR model path is missing model weights: {MODEL_PATH}.')
-if not _os.path.isdir(GSM8K_PATH):
-    raise FileNotFoundError(f'SDAR GSM8K path does not exist: {GSM8K_PATH}.')
-if not _os.path.exists(_os.path.join(GSM8K_PATH, 'test.jsonl')):
-    raise FileNotFoundError(f'SDAR GSM8K path is missing test.jsonl: {GSM8K_PATH}.')
 
 MODEL_CONFIG = _load_model_config(MODEL_PATH)
 NUM_WORKERS = int(_os.environ.get('SDAR_EVAL_GPUS', _default_num_workers()))
@@ -138,12 +127,12 @@ torch_dtype = {
 if torch_dtype is None:
     raise ValueError("SDAR_TORCH_DTYPE must be one of: float16, bfloat16, float32.")
 
-gsm8k_datasets = [
+math_datasets = [
     dict(
-        abbr=GSM8K_ABBR,
-        type=GSM8KDataset,
-        path=GSM8K_PATH,
-        reader_cfg=dict(input_columns=['question'], output_column='answer'),
+        abbr=MATH_ABBR,
+        type=MATHDataset,
+        path=MATH_PATH,
+        reader_cfg=dict(input_columns=['problem'], output_column='solution'),
         infer_cfg=dict(
             prompt_template=dict(
                 type=PromptTemplate,
@@ -152,7 +141,7 @@ gsm8k_datasets = [
                         dict(
                             role='HUMAN',
                             prompt=(
-                                '{question}\nSolve the problem step by step, '
+                                '{problem}\nSolve the problem step by step, '
                                 'but keep the reasoning concise. Once you '
                                 'know the answer, put the final answer '
                                 'within \\boxed{} and stop immediately. '
@@ -170,12 +159,11 @@ gsm8k_datasets = [
         eval_cfg=dict(
             evaluator=dict(type=MATHEvaluator, version='v2'),
             pred_postprocessor=dict(type=math_postprocess_sdar),
-            dataset_postprocessor=dict(type=gsm8k_dataset_postprocess),
         ),
     )
 ]
 
-datasets = [*gsm8k_datasets]
+datasets = [*math_datasets]
 for dataset in datasets:
     dataset['infer_cfg']['inferencer']['batch_size'] = INFER_BATCH_SIZE
     if TEST_RANGE:
@@ -226,7 +214,7 @@ models = [
 ]
 
 summarizer = dict(
-    dataset_abbrs=[[GSM8K_ABBR, 'accuracy']],
+    dataset_abbrs=[[MATH_ABBR, 'accuracy']],
     summary_groups=[],
 )
 
@@ -252,7 +240,7 @@ eval = dict(
     ),
 )
 
-work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar-gap')
+work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/math_test_gap')
 
 globals().pop('_default_num_workers', None)
 globals().pop('_format_threshold', None)
