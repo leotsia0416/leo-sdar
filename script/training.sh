@@ -73,6 +73,24 @@ normalize_bool() {
     esac
 }
 
+sanitize_name() {
+    local value="${1:-unnamed}"
+    value="${value,,}"
+    value="$(printf '%s' "${value}" | sed 's/[^a-z0-9._-]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+    if [[ -z "${value}" ]]; then
+        value="unnamed"
+    fi
+    printf '%s\n' "${value}"
+}
+
+link_bundle_path() {
+    local target="${1:?missing target}"
+    local link_path="${2:?missing link path}"
+    mkdir -p "$(dirname "${link_path}")"
+    rm -f "${link_path}"
+    ln -s "${target}" "${link_path}"
+}
+
 has_model_weights() {
     local model_dir="${1:?missing model dir}"
     [[ -e "${model_dir}/model.safetensors" ]] && return 0
@@ -98,6 +116,55 @@ validate_hf_model_dir() {
         echo "${label} is missing model weights: ${model_dir}" >&2
         exit 1
     fi
+}
+
+prepare_training_run_bundle() {
+    local output_dir="${1:?missing output dir}"
+    local launcher_workdir="${2:?missing launcher workdir}"
+    local run_root=""
+    local run_stamp=""
+    local run_label=""
+    local slurm_log_prefix=""
+
+    run_root="${TRAIN_RUN_ROOT:-$(yaml_get_optional run_root)}"
+    run_root="${run_root:-${REPO_ROOT}/runs/train}"
+    mkdir -p "${run_root}"
+    export TRAIN_RUN_ROOT="${run_root}"
+
+    if [[ -n "${TRAIN_RUN_NAME_BASE:-}" ]]; then
+        run_label="${TRAIN_RUN_NAME_BASE}"
+    else
+        run_label="train_${TRAIN_PROFILE}_${TRAIN_DATASET_TAG}"
+    fi
+
+    run_stamp="$(date +%Y%m%d_%H%M%S)"
+    run_label="$(sanitize_name "${run_label}")"
+    export TRAIN_RUN_BUNDLE_DIR="${TRAIN_RUN_BUNDLE_DIR:-${TRAIN_RUN_ROOT}/${run_stamp}_${run_label}_job${job_id}}"
+    mkdir -p "${TRAIN_RUN_BUNDLE_DIR}"
+
+    slurm_log_prefix="${REPO_ROOT}/logs/train_${job_id}"
+    link_bundle_path "${slurm_log_prefix}.out" "${TRAIN_RUN_BUNDLE_DIR}/slurm.out"
+    link_bundle_path "${slurm_log_prefix}.err" "${TRAIN_RUN_BUNDLE_DIR}/slurm.err"
+    link_bundle_path "${output_dir}" "${TRAIN_RUN_BUNDLE_DIR}/output_dir"
+    link_bundle_path "${output_dir}" "${TRAIN_RUN_BUNDLE_DIR}/checkpoints"
+
+    cp "${TMP_CONFIG_FILE}" "${TRAIN_RUN_BUNDLE_DIR}/training_run_config.yaml"
+    cp "${CONFIG_FILE}" "${TRAIN_RUN_BUNDLE_DIR}/training_defaults.yaml"
+
+    cat > "${TRAIN_RUN_BUNDLE_DIR}/run_meta.yaml" <<EOF
+runner: train
+generated_from: script/training.sh
+slurm_job_id: "${job_id}"
+slurm_job_name: "${SLURM_JOB_NAME:-}"
+train_profile: "${TRAIN_PROFILE}"
+model_path: "${TRAIN_MODEL_PATH}"
+resume_from_checkpoint: "${TRAIN_RESUME_FROM_CHECKPOINT}"
+dataset: "${TRAIN_DATASET}"
+tokenized_path: "${TRAIN_TOKENIZED_PATH}"
+output_dir: "${output_dir}"
+launcher_workdir: "${launcher_workdir}"
+run_root: "${TRAIN_RUN_ROOT}"
+EOF
 }
 
 TRAIN_HEAD_ONLY="$(normalize_bool "${TRAIN_HEAD_ONLY:-false}")"
@@ -605,8 +672,21 @@ else:
 config_path.write_text(updated)
 PY
 
+TRAIN_OUTPUT_DIR="$(sed -n 's/^output_dir:[[:space:]]*//p' "${TMP_CONFIG_FILE}" | head -n 1 | sed "s/^['\"]//; s/['\"]$//")"
+if [[ -z "${TRAIN_OUTPUT_DIR}" ]]; then
+    echo "Cannot determine output_dir from ${TMP_CONFIG_FILE}" >&2
+    exit 1
+fi
+case "${TRAIN_OUTPUT_DIR}" in
+    /*) ;;
+    *) TRAIN_OUTPUT_DIR="$(yaml_get launcher_workdir)/${TRAIN_OUTPUT_DIR#./}" ;;
+esac
+
+prepare_training_run_bundle "${TRAIN_OUTPUT_DIR}" "$(yaml_get launcher_workdir)"
+
 echo "Training dataset: ${TRAIN_DATASET}" >&2
 echo "Tokenized cache: ${TRAIN_TOKENIZED_PATH}" >&2
+echo "Run bundle dir: ${TRAIN_RUN_BUNDLE_DIR}" >&2
 echo "Mix strategy: ${TRAIN_MIX_STRATEGY}" >&2
 echo "Training profile: ${TRAIN_PROFILE}" >&2
 if [[ -n "${TRAIN_INTERLEAVE_PROBS}" ]]; then

@@ -193,3 +193,7 @@ JetEngine/
 *.vsix
 *.pdf
 artifacts/html/
+runs/eval/*
+!runs/eval/.gitkeep
+runs/train/*
+!runs/train/.gitkeep
