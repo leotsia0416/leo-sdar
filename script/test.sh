@@ -113,7 +113,7 @@ model:
   model_name: "${SDAR_MODEL_NAME}"
 eval:
   eval_scope: "${SDAR_EVAL_SCOPE}"
-  eval_config: "configs/eval_sdar_lmdeploy.py"
+  eval_config: "${SDAR_EVAL_CONFIG}"
   eval_gpus: "${SDAR_EVAL_GPUS}"
   infer_batch_size: "${SDAR_INFER_BATCH_SIZE}"
   confidence_threshold: "${SDAR_CONFIDENCE_THRESHOLD}"
@@ -192,6 +192,7 @@ validate_hf_model_dir "${SDAR_MODEL_PATH}"
 export SDAR_MODEL_ROOT="${SDAR_MODEL_ROOT:-$(dirname "${SDAR_MODEL_PATH}")}"
 export SDAR_MODEL_NAME="${SDAR_MODEL_NAME:-$(basename "${SDAR_MODEL_PATH}")}"
 export SDAR_EVAL_SCOPE="${SDAR_EVAL_SCOPE:-gsm8k}"
+export SDAR_EVAL_CONFIG="${SDAR_EVAL_CONFIG:-configs/eval_sdar_lmdeploy.py}"
 export SDAR_EVAL_GPUS="${SDAR_EVAL_GPUS:-2}"
 export SDAR_INFER_BATCH_SIZE="${SDAR_INFER_BATCH_SIZE:-1}"
 export SDAR_CONFIDENCE_THRESHOLD="${SDAR_CONFIDENCE_THRESHOLD:-0.95}"
@@ -220,7 +221,7 @@ echo "Using model path: ${SDAR_MODEL_PATH}" >&2
 echo "Run bundle dir: ${SDAR_RUN_BUNDLE_DIR}" >&2
 echo "Work dir: ${SDAR_WORK_DIR_ABS}" >&2
 
-/work/leotsia0416/sdar_eval/bin/python run.py configs/eval_sdar_lmdeploy.py
+/work/leotsia0416/sdar_eval/bin/python run.py "${SDAR_EVAL_CONFIG}"
 
 EXP_DIR="$(locate_exp_dir "${SDAR_WORK_DIR_ABS}" "${LAUNCH_TS}")"
 finalize_eval_run_bundle "${EXP_DIR}"
