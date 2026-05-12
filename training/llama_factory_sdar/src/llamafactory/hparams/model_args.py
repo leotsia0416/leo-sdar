@@ -211,6 +211,10 @@ class BaseModelArguments:
         default=None,
         metadata={"help": "Sigmoid threshold used to turn GAP remask logits into remask decisions."},
     )
+    gap_remask_window_blocks: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of recent generated answer blocks exposed to the GAP remask head."},
+    )
     gap_remask_loss_weight: Optional[float] = field(
         default=None,
         metadata={"help": "Loss weight applied to the GAP remask classification loss."},
@@ -275,6 +279,10 @@ class BaseModelArguments:
         default=None,
         metadata={"help": "Loss weight applied to the GAP remask GRPO objective."},
     )
+    gap_grpo_action_granularity: Optional[str] = field(
+        default=None,
+        metadata={"help": "Action granularity used by GAP GRPO remask branches: threshold, token, or rollback."},
+    )
     gap_grpo_num_samples: Optional[int] = field(
         default=None,
         metadata={"help": "Number of remask action samples drawn per state for GAP GRPO."},
@@ -286,6 +294,10 @@ class BaseModelArguments:
     gap_grpo_min_visible_blocks: Optional[int] = field(
         default=None,
         metadata={"help": "Minimum number of generated answer blocks before GAP GRPO may start rollback/remask branching."},
+    )
+    gap_grpo_fixed_visible_blocks: Optional[bool] = field(
+        default=None,
+        metadata={"help": "If enabled, sample GAP generated-window states with exactly gap_grpo_min_visible_blocks visible blocks."},
     )
     gap_grpo_candidate_window_blocks: Optional[int] = field(
         default=None,

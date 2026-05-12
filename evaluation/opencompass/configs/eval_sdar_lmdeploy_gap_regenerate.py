@@ -8,7 +8,7 @@ from opencompass.datasets import (
     math_postprocess_sdar,
     math_postprocess_v2,
 )
-from opencompass.models import LMDeployGapRemaskwithChatTemplate
+from opencompass.models import LMDeployGapRegeneratewithChatTemplate
 from opencompass.openicl.icl_inferencer import GenInferencer
 from opencompass.openicl.icl_prompt_template import PromptTemplate
 from opencompass.openicl.icl_retriever import ZeroRetriever
@@ -271,7 +271,7 @@ dllm_unmasking_strategy = (
     else 'low_confidence_static'
 )
 model_abbr = (
-    f'{MODEL_NAME}-lmdeploy-gapremask-b{BLOCK_LENGTH}'
+    f'{MODEL_NAME}-lmdeploy-gapregen-b{BLOCK_LENGTH}'
     f'-thr{_format_threshold(CONFIDENCE_THRESHOLD)}'
     f'-rt{_format_threshold(GAP_REMASK_THRESHOLD)}'
 )
@@ -295,7 +295,7 @@ if RANDOM_SEED is not None:
 
 models = [
     dict(
-        type=LMDeployGapRemaskwithChatTemplate,
+        type=LMDeployGapRegeneratewithChatTemplate,
         abbr=model_abbr,
         path=MODEL_PATH,
         run_cfg=dict(num_gpus=TP),
@@ -311,6 +311,16 @@ models = [
             gap_remask_interval_blocks=GAP_REMASK_INTERVAL_BLOCKS,
             gap_remask_start_block=GAP_REMASK_START_BLOCK,
             gap_remask_max_tokens_per_block=GAP_REMASK_MAX_TOKENS_PER_BLOCK,
+            gap_regenerate_window_blocks=int(_os.environ.get('SDAR_GAP_REGENERATE_WINDOW_BLOCKS', '1')),
+            gap_regenerate_check_interval_blocks=int(
+                _os.environ.get('SDAR_GAP_REGENERATE_CHECK_INTERVAL_BLOCKS', '0')
+            ),
+            gap_regenerate_max_total_rollbacks=int(
+                _os.environ.get('SDAR_GAP_REGENERATE_MAX_TOTAL_ROLLBACKS', '1')
+            ),
+            gap_regenerate_max_total_tokens=int(
+                _os.environ.get('SDAR_GAP_REGENERATE_MAX_TOTAL_TOKENS', '4')
+            ),
         ),
     )
 ]
@@ -337,7 +347,7 @@ eval = dict(
     ),
 )
 
-work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar-lmdeploy-gap-remask')
+work_dir = _os.environ.get('SDAR_WORK_DIR', './outputs/eval-chat-sdar-lmdeploy-gap-regenerate')
 
 del _default_num_workers
 del _env_flag

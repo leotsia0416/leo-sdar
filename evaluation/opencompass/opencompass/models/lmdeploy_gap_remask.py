@@ -13,7 +13,7 @@ from .lmdeploy_with_tf_above_v4_33 import LMDeploywithChatTemplate
 
 
 class LMDeployGapRemaskwithChatTemplate(LMDeploywithChatTemplate):
-    """LMDeploy SDAR wrapper with an opt-in GAP remask decode route."""
+    """LMDeploy SDAR wrapper with installed-LMDeploy GAP remask patching."""
 
     def _append_remask_trace(self, inputs, outputs, max_out_len):
         trace_path = os.getenv('SDAR_LMDEPLOY_REMASK_TRACE_PATH', '').strip()
@@ -26,10 +26,20 @@ class LMDeployGapRemaskwithChatTemplate(LMDeploywithChatTemplate):
             gap_remask_threshold=os.getenv('SDAR_LMDEPLOY_GAP_REMASK_THRESHOLD', ''),
             gap_remask_start_block=os.getenv('SDAR_LMDEPLOY_GAP_REMASK_START_BLOCK', ''),
             gap_remask_interval_blocks=os.getenv('SDAR_LMDEPLOY_GAP_REMASK_INTERVAL_BLOCKS', ''),
+            gap_remask_max_tokens_per_block=os.getenv('SDAR_LMDEPLOY_GAP_REMASK_MAX_TOKENS_PER_BLOCK', ''),
             gap_remask_head_loaded=gap_remask_head_loaded(),
             steps_with_remask=trace['steps_with_remask'],
             total_remasked_tokens=trace['total_remasked_tokens'],
             remasked_tokens_per_step=trace['remasked_tokens_per_step'],
+            total_eligible_blocks=trace['total_eligible_blocks'],
+            eligible_blocks_per_step=trace['eligible_blocks_per_step'],
+            max_remask_prob=trace['max_remask_prob'],
+            mean_eligible_remask_prob=trace['mean_eligible_remask_prob'],
+            gap_logits_missing_steps=trace['gap_logits_missing_steps'],
+            pre_unmasked_blocks_total=trace['pre_unmasked_blocks_total'],
+            pre_unmasked_blocks_per_step=trace['pre_unmasked_blocks_per_step'],
+            get_logits_hook_steps=trace['get_logits_hook_steps'],
+            gap_logits_set_steps=trace['gap_logits_set_steps'],
             prompt_chars=[len(str(item)) for item in inputs],
             output_chars=[len(str(item)) for item in outputs],
         )
@@ -56,8 +66,7 @@ class LMDeployGapRemaskwithChatTemplate(LMDeploywithChatTemplate):
         super()._load_model(path, added_model_kwargs)
         if not gap_remask_head_loaded():
             self.logger.warning(
-                'GAP remask head weights were not loaded; disabling remask decisions for this checkpoint. '
-                'Set SDAR_LMDEPLOY_ALLOW_RANDOM_REMASK_HEAD=1 only for debugging random-head behavior.'
+                'GAP remask head weights were not loaded; remask decisions will use random initialization.'
             )
 
     def generate(self, inputs, max_out_len, stopping_criteria=[], **kwargs):

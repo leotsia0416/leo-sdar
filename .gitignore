@@ -197,3 +197,4 @@ runs/eval/*
 !runs/eval/.gitkeep
 runs/train/*
 !runs/train/.gitkeep
+script/

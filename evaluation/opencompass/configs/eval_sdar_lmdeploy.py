@@ -291,7 +291,7 @@ models = [
         type=LMDeploywithChatTemplate,
         abbr=model_abbr,
         path=MODEL_PATH,
-        run_cfg=dict(num_gpus=1),
+        run_cfg=dict(num_gpus=TP),
         generation_kwargs=generation_kwargs,
         model_kwargs=dict(
             tp=TP,

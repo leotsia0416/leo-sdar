@@ -53,6 +53,25 @@ resolve_work_dir_abs() {
   esac
 }
 
+detect_visible_gpu_count() {
+  local visible="${CUDA_VISIBLE_DEVICES:-}"
+  local slurm_visible="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+  local source="${visible:-$slurm_visible}"
+  if [[ -n "${source}" ]]; then
+    python - <<'PY' "${source}"
+import sys
+items = [x.strip() for x in sys.argv[1].split(',') if x.strip()]
+print(max(1, len(items)) if items else 1)
+PY
+    return 0
+  fi
+  if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
+    printf '%s\n' "${SLURM_GPUS_ON_NODE}"
+    return 0
+  fi
+  printf '1\n'
+}
+
 locate_exp_dir() {
   local work_dir="$1"
   local launch_ts="$2"
@@ -193,7 +212,17 @@ export SDAR_MODEL_ROOT="${SDAR_MODEL_ROOT:-$(dirname "${SDAR_MODEL_PATH}")}"
 export SDAR_MODEL_NAME="${SDAR_MODEL_NAME:-$(basename "${SDAR_MODEL_PATH}")}"
 export SDAR_EVAL_SCOPE="${SDAR_EVAL_SCOPE:-gsm8k}"
 export SDAR_EVAL_CONFIG="${SDAR_EVAL_CONFIG:-configs/eval_sdar_lmdeploy.py}"
-export SDAR_EVAL_GPUS="${SDAR_EVAL_GPUS:-2}"
+VISIBLE_GPU_COUNT="$(detect_visible_gpu_count)"
+export SDAR_VISIBLE_GPU_COUNT="${VISIBLE_GPU_COUNT}"
+export SDAR_EVAL_GPUS="${SDAR_EVAL_GPUS:-${VISIBLE_GPU_COUNT}}"
+if [[ "${SDAR_EVAL_CONFIG}" == *"eval_sdar_lmdeploy_gap_regenerate.py" ]]; then
+  export SDAR_LMDEPLOY_TP="${SDAR_LMDEPLOY_TP:-1}"
+  if [[ -z "${SDAR_LMDEPLOY_GAP_SCORE_DEVICE:-}" && "${VISIBLE_GPU_COUNT}" -ge 2 ]]; then
+    export SDAR_LMDEPLOY_GAP_SCORE_DEVICE="cuda:1"
+  fi
+else
+  export SDAR_LMDEPLOY_TP="${SDAR_LMDEPLOY_TP:-${VISIBLE_GPU_COUNT}}"
+fi
 export SDAR_INFER_BATCH_SIZE="${SDAR_INFER_BATCH_SIZE:-1}"
 export SDAR_CONFIDENCE_THRESHOLD="${SDAR_CONFIDENCE_THRESHOLD:-0.95}"
 export SDAR_BLOCK_LENGTH="${SDAR_BLOCK_LENGTH:-4}"

@@ -21,9 +21,9 @@ TRAIN_HF_HOME="${TRAIN_HF_HOME:-${REPO_ROOT}/Models/hf}"
 HF_HOME="${TRAIN_HF_HOME}"
 HF_MODULES_CACHE="${HF_HOME}/modules"
 export HF_HOME HF_MODULES_CACHE
-export SDAR_GAP_REMASK_THRESHOLD_SCHEDULE="${SDAR_GAP_REMASK_THRESHOLD_SCHEDULE:-0.00:0.30,0.30:0.50,0.70:0.65}"
-export SDAR_GAP_REMASK_LOSS_WEIGHT_SCHEDULE="${SDAR_GAP_REMASK_LOSS_WEIGHT_SCHEDULE:-0.00:0.08,0.33:0.02,0.67:0.0}"
-export SDAR_GAP_GRPO_LOSS_WEIGHT_SCHEDULE="${SDAR_GAP_GRPO_LOSS_WEIGHT_SCHEDULE:-0.00:0.25,0.33:0.35,0.67:0.4}"
+export SDAR_GAP_REMASK_THRESHOLD_SCHEDULE="${SDAR_GAP_REMASK_THRESHOLD_SCHEDULE:-0.00:0.30,0.30:0.45,0.70:0.55}"
+export SDAR_GAP_REMASK_LOSS_WEIGHT_SCHEDULE="${SDAR_GAP_REMASK_LOSS_WEIGHT_SCHEDULE:-0.00:0.07,0.30:0.04,0.50:0.01,0.70:0.0}"
+export SDAR_GAP_GRPO_LOSS_WEIGHT_SCHEDULE="${SDAR_GAP_GRPO_LOSS_WEIGHT_SCHEDULE:-0.00:0.0,0.30:0.10,0.50:0.20,0.70:0.30}"
 unset TRANSFORMERS_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ ! -f "${SCRIPT_DIR}/config/training.yaml" ]]; then
@@ -209,14 +209,20 @@ TRAIN_ROLLOUT_SCOPE="${TRAIN_ROLLOUT_SCOPE:-$(yaml_get gap_rollout_scope)}"
 TRAIN_GAP_REVEAL_RATIO="${TRAIN_GAP_REVEAL_RATIO:-$(yaml_get gap_reveal_ratio)}"
 TRAIN_GAP_MIN_REVEAL_TOKENS="${TRAIN_GAP_MIN_REVEAL_TOKENS:-$(yaml_get gap_min_reveal_tokens)}"
 TRAIN_GAP_REMASK_THRESHOLD="${TRAIN_GAP_REMASK_THRESHOLD:-$(yaml_get gap_remask_threshold)}"
+TRAIN_GAP_REMASK_WINDOW_BLOCKS="${TRAIN_GAP_REMASK_WINDOW_BLOCKS:-$(yaml_get_optional gap_remask_window_blocks)}"
+TRAIN_GAP_REMASK_WINDOW_BLOCKS="${TRAIN_GAP_REMASK_WINDOW_BLOCKS:-3}"
 TRAIN_GAP_REMASK_LOSS_WEIGHT="${TRAIN_GAP_REMASK_LOSS_WEIGHT:-$(yaml_get gap_remask_loss_weight)}"
 TRAIN_GAP_GLOBAL_LOSS_WEIGHT="${TRAIN_GAP_GLOBAL_LOSS_WEIGHT:-$(yaml_get gap_global_loss_weight)}"
 TRAIN_GAP_DIFFUSION_LOSS_WEIGHT="${TRAIN_GAP_DIFFUSION_LOSS_WEIGHT:-$(yaml_get gap_diffusion_loss_weight)}"
 TRAIN_GAP_REMASK_DEFAULT_P_MASK="${TRAIN_GAP_REMASK_DEFAULT_P_MASK:-$(yaml_get gap_remask_default_p_mask)}"
 TRAIN_GAP_GRPO_LOSS_WEIGHT="${TRAIN_GAP_GRPO_LOSS_WEIGHT:-$(yaml_get gap_grpo_loss_weight)}"
+TRAIN_GAP_GRPO_ACTION_GRANULARITY="${TRAIN_GAP_GRPO_ACTION_GRANULARITY:-$(yaml_get_optional gap_grpo_action_granularity)}"
+TRAIN_GAP_GRPO_ACTION_GRANULARITY="${TRAIN_GAP_GRPO_ACTION_GRANULARITY:-threshold}"
 TRAIN_GAP_GRPO_NUM_SAMPLES="${TRAIN_GAP_GRPO_NUM_SAMPLES:-$(yaml_get gap_grpo_num_samples)}"
 TRAIN_GAP_GRPO_NUM_PARENTS="${TRAIN_GAP_GRPO_NUM_PARENTS:-$(yaml_get_optional gap_grpo_num_parents)}"
 TRAIN_GAP_GRPO_MIN_VISIBLE_BLOCKS="${TRAIN_GAP_GRPO_MIN_VISIBLE_BLOCKS:-$(yaml_get gap_grpo_min_visible_blocks)}"
+TRAIN_GAP_GRPO_FIXED_VISIBLE_BLOCKS="${TRAIN_GAP_GRPO_FIXED_VISIBLE_BLOCKS:-$(yaml_get_optional gap_grpo_fixed_visible_blocks)}"
+TRAIN_GAP_GRPO_FIXED_VISIBLE_BLOCKS="${TRAIN_GAP_GRPO_FIXED_VISIBLE_BLOCKS:-true}"
 TRAIN_GAP_GRPO_CANDIDATE_WINDOW_BLOCKS="${TRAIN_GAP_GRPO_CANDIDATE_WINDOW_BLOCKS:-$(yaml_get gap_grpo_candidate_window_blocks)}"
 TRAIN_GAP_GRPO_DIVERSE_ROLLBACKS="${TRAIN_GAP_GRPO_DIVERSE_ROLLBACKS:-$(yaml_get gap_grpo_diverse_rollbacks)}"
 TRAIN_GAP_GRPO_CLIP_EPS="${TRAIN_GAP_GRPO_CLIP_EPS:-$(yaml_get gap_grpo_clip_eps)}"
@@ -483,8 +489,8 @@ if [[ "${USE_FORMAT_ALIGN_DATASET}" == "true" ]]; then
     fi
 fi
 
-sed '/^launcher_[^:]*:/d' "${CONFIG_FILE}" | sed "s/%j/${job_id}/g" > "${TMP_CONFIG_FILE}"
-python - "${TMP_CONFIG_FILE}" "${SAVE_STEPS}" "${TRAIN_HEAD_ONLY}" "${HEAD_ONLY_TRAINABLE_MODULES}" "${TRAIN_DATASET}" "${TRAIN_TOKENIZED_PATH}" "${TRAIN_RUN_NAME_BASE}" "${TRAIN_MIX_STRATEGY}" "${TRAIN_INTERLEAVE_PROBS}" "${TRAIN_GAP_TRAINING_MODE}" "${TRAIN_GAP_ROLLOUT_STEPS}" "${TRAIN_GAP_ROLLOUT_STRATEGY}" "${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD}" "${TRAIN_ROLLOUT_SCOPE}" "${TRAIN_GAP_REVEAL_RATIO}" "${TRAIN_GAP_MIN_REVEAL_TOKENS}" "${TRAIN_GAP_REMASK_THRESHOLD}" "${TRAIN_GAP_REMASK_LOSS_WEIGHT}" "${TRAIN_GAP_GLOBAL_LOSS_WEIGHT}" "${TRAIN_GAP_REMASK_DEFAULT_P_MASK}" "${TRAIN_GAP_GRPO_LOSS_WEIGHT}" "${TRAIN_GAP_GRPO_NUM_SAMPLES}" "${TRAIN_GAP_GRPO_NUM_PARENTS}" "${TRAIN_GAP_GRPO_MIN_VISIBLE_BLOCKS}" "${TRAIN_GAP_GRPO_CANDIDATE_WINDOW_BLOCKS}" "${TRAIN_GAP_GRPO_DIVERSE_ROLLBACKS}" "${TRAIN_GAP_GRPO_CLIP_EPS}" "${TRAIN_GAP_GRPO_ENTROPY_COEF}" "${TRAIN_GAP_GRPO_REMASK_PENALTY}" "${TRAIN_GAP_GRPO_ADVANTAGE_EPS}" "${TRAIN_GAP_GRPO_SAMPLE_PROB_EPS}" "${TRAIN_GAP_GRPO_DENSE_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_TERMINAL_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_FORMAT_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_ROLLOUT_TEMPERATURE}" "${TRAIN_GAP_GRPO_INITIAL_ROLLOUT_TEMPERATURE}" "${TRAIN_GAP_GRPO_ROLLOUT_TOP_K}" "${TRAIN_GAP_GRPO_ROLLOUT_TOP_P}" "${TRAIN_DISABLE_GRADIENT_CHECKPOINTING}" "${TRAIN_GRADIENT_CHECKPOINTING}" "${TRAIN_USE_REENTRANT_GC}" "${TRAIN_GRADIENT_CHECKPOINTING_KWARGS}" "${TRAIN_PER_DEVICE_TRAIN_BATCH_SIZE}" "${TRAIN_GRADIENT_ACCUMULATION_STEPS}" "${TRAIN_MODEL_PATH}" "${TRAIN_RESUME_FROM_CHECKPOINT}" "${TRAIN_LEARNING_RATE}" "${TRAIN_NUM_TRAIN_EPOCHS}" "${TRAIN_CUTOFF_LEN}" "${TRAIN_OVERWRITE_CACHE}" "${TRAIN_GAP_DIFFUSION_LOSS_WEIGHT}" "${TRAIN_GAP_GRPO_MIXED_TERMINAL_FILTER}" "${TRAIN_GAP_GRPO_CORRECT_THRESHOLD}" "${TRAIN_GAP_GRPO_MIN_CORRECT_COUNT}" "${TRAIN_GAP_GRPO_MAX_CORRECT_COUNT}" <<'PY'
+sed -e '/^launcher_[^:]*:/d' -e '/^run_root:/d' "${CONFIG_FILE}" | sed "s/%j/${job_id}/g" > "${TMP_CONFIG_FILE}"
+python - "${TMP_CONFIG_FILE}" "${SAVE_STEPS}" "${TRAIN_HEAD_ONLY}" "${HEAD_ONLY_TRAINABLE_MODULES}" "${TRAIN_DATASET}" "${TRAIN_TOKENIZED_PATH}" "${TRAIN_RUN_NAME_BASE}" "${TRAIN_MIX_STRATEGY}" "${TRAIN_INTERLEAVE_PROBS}" "${TRAIN_GAP_TRAINING_MODE}" "${TRAIN_GAP_ROLLOUT_STEPS}" "${TRAIN_GAP_ROLLOUT_STRATEGY}" "${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD}" "${TRAIN_ROLLOUT_SCOPE}" "${TRAIN_GAP_REVEAL_RATIO}" "${TRAIN_GAP_MIN_REVEAL_TOKENS}" "${TRAIN_GAP_REMASK_THRESHOLD}" "${TRAIN_GAP_REMASK_WINDOW_BLOCKS}" "${TRAIN_GAP_REMASK_LOSS_WEIGHT}" "${TRAIN_GAP_GLOBAL_LOSS_WEIGHT}" "${TRAIN_GAP_REMASK_DEFAULT_P_MASK}" "${TRAIN_GAP_GRPO_LOSS_WEIGHT}" "${TRAIN_GAP_GRPO_ACTION_GRANULARITY}" "${TRAIN_GAP_GRPO_NUM_SAMPLES}" "${TRAIN_GAP_GRPO_NUM_PARENTS}" "${TRAIN_GAP_GRPO_MIN_VISIBLE_BLOCKS}" "${TRAIN_GAP_GRPO_FIXED_VISIBLE_BLOCKS}" "${TRAIN_GAP_GRPO_CANDIDATE_WINDOW_BLOCKS}" "${TRAIN_GAP_GRPO_DIVERSE_ROLLBACKS}" "${TRAIN_GAP_GRPO_CLIP_EPS}" "${TRAIN_GAP_GRPO_ENTROPY_COEF}" "${TRAIN_GAP_GRPO_REMASK_PENALTY}" "${TRAIN_GAP_GRPO_ADVANTAGE_EPS}" "${TRAIN_GAP_GRPO_SAMPLE_PROB_EPS}" "${TRAIN_GAP_GRPO_DENSE_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_TERMINAL_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_FORMAT_REWARD_WEIGHT}" "${TRAIN_GAP_GRPO_ROLLOUT_TEMPERATURE}" "${TRAIN_GAP_GRPO_INITIAL_ROLLOUT_TEMPERATURE}" "${TRAIN_GAP_GRPO_ROLLOUT_TOP_K}" "${TRAIN_GAP_GRPO_ROLLOUT_TOP_P}" "${TRAIN_DISABLE_GRADIENT_CHECKPOINTING}" "${TRAIN_GRADIENT_CHECKPOINTING}" "${TRAIN_USE_REENTRANT_GC}" "${TRAIN_GRADIENT_CHECKPOINTING_KWARGS}" "${TRAIN_PER_DEVICE_TRAIN_BATCH_SIZE}" "${TRAIN_GRADIENT_ACCUMULATION_STEPS}" "${TRAIN_MODEL_PATH}" "${TRAIN_RESUME_FROM_CHECKPOINT}" "${TRAIN_LEARNING_RATE}" "${TRAIN_NUM_TRAIN_EPOCHS}" "${TRAIN_CUTOFF_LEN}" "${TRAIN_OVERWRITE_CACHE}" "${TRAIN_GAP_DIFFUSION_LOSS_WEIGHT}" "${TRAIN_GAP_GRPO_MIXED_TERMINAL_FILTER}" "${TRAIN_GAP_GRPO_CORRECT_THRESHOLD}" "${TRAIN_GAP_GRPO_MIN_CORRECT_COUNT}" "${TRAIN_GAP_GRPO_MAX_CORRECT_COUNT}" <<'PY'
 import pathlib
 import re
 import sys
@@ -506,44 +512,47 @@ train_rollout_scope = sys.argv[14]
 train_gap_reveal_ratio = sys.argv[15]
 train_gap_min_reveal_tokens = sys.argv[16]
 train_gap_remask_threshold = sys.argv[17]
-train_gap_remask_loss_weight = sys.argv[18]
-train_gap_global_loss_weight = sys.argv[19]
-train_gap_remask_default_p_mask = sys.argv[20]
-train_gap_grpo_loss_weight = sys.argv[21]
-train_gap_grpo_num_samples = sys.argv[22]
-train_gap_grpo_num_parents = sys.argv[23]
-train_gap_grpo_min_visible_blocks = sys.argv[24]
-train_gap_grpo_candidate_window_blocks = sys.argv[25]
-train_gap_grpo_diverse_rollbacks = sys.argv[26]
-train_gap_grpo_clip_eps = sys.argv[27]
-train_gap_grpo_entropy_coef = sys.argv[28]
-train_gap_grpo_remask_penalty = sys.argv[29]
-train_gap_grpo_advantage_eps = sys.argv[30]
-train_gap_grpo_sample_prob_eps = sys.argv[31]
-train_gap_grpo_dense_reward_weight = sys.argv[32]
-train_gap_grpo_terminal_reward_weight = sys.argv[33]
-train_gap_grpo_format_reward_weight = sys.argv[34]
-train_gap_grpo_rollout_temperature = sys.argv[35]
-train_gap_grpo_initial_rollout_temperature = sys.argv[36]
-train_gap_grpo_rollout_top_k = sys.argv[37]
-train_gap_grpo_rollout_top_p = sys.argv[38]
-train_disable_gradient_checkpointing = sys.argv[39]
-train_gradient_checkpointing = sys.argv[40]
-train_use_reentrant_gc = sys.argv[41]
-train_gradient_checkpointing_kwargs = sys.argv[42]
-train_per_device_train_batch_size = sys.argv[43]
-train_gradient_accumulation_steps = sys.argv[44]
-train_model_path = sys.argv[45]
-train_resume_from_checkpoint = sys.argv[46]
-train_learning_rate = sys.argv[47]
-train_num_train_epochs = sys.argv[48]
-train_cutoff_len = sys.argv[49]
-train_overwrite_cache = sys.argv[50]
-train_gap_diffusion_loss_weight = sys.argv[51]
-train_gap_grpo_mixed_terminal_filter = sys.argv[52]
-train_gap_grpo_correct_threshold = sys.argv[53]
-train_gap_grpo_min_correct_count = sys.argv[54]
-train_gap_grpo_max_correct_count = sys.argv[55]
+train_gap_remask_window_blocks = sys.argv[18]
+train_gap_remask_loss_weight = sys.argv[19]
+train_gap_global_loss_weight = sys.argv[20]
+train_gap_remask_default_p_mask = sys.argv[21]
+train_gap_grpo_loss_weight = sys.argv[22]
+train_gap_grpo_action_granularity = sys.argv[23]
+train_gap_grpo_num_samples = sys.argv[24]
+train_gap_grpo_num_parents = sys.argv[25]
+train_gap_grpo_min_visible_blocks = sys.argv[26]
+train_gap_grpo_fixed_visible_blocks = sys.argv[27]
+train_gap_grpo_candidate_window_blocks = sys.argv[28]
+train_gap_grpo_diverse_rollbacks = sys.argv[29]
+train_gap_grpo_clip_eps = sys.argv[30]
+train_gap_grpo_entropy_coef = sys.argv[31]
+train_gap_grpo_remask_penalty = sys.argv[32]
+train_gap_grpo_advantage_eps = sys.argv[33]
+train_gap_grpo_sample_prob_eps = sys.argv[34]
+train_gap_grpo_dense_reward_weight = sys.argv[35]
+train_gap_grpo_terminal_reward_weight = sys.argv[36]
+train_gap_grpo_format_reward_weight = sys.argv[37]
+train_gap_grpo_rollout_temperature = sys.argv[38]
+train_gap_grpo_initial_rollout_temperature = sys.argv[39]
+train_gap_grpo_rollout_top_k = sys.argv[40]
+train_gap_grpo_rollout_top_p = sys.argv[41]
+train_disable_gradient_checkpointing = sys.argv[42]
+train_gradient_checkpointing = sys.argv[43]
+train_use_reentrant_gc = sys.argv[44]
+train_gradient_checkpointing_kwargs = sys.argv[45]
+train_per_device_train_batch_size = sys.argv[46]
+train_gradient_accumulation_steps = sys.argv[47]
+train_model_path = sys.argv[48]
+train_resume_from_checkpoint = sys.argv[49]
+train_learning_rate = sys.argv[50]
+train_num_train_epochs = sys.argv[51]
+train_cutoff_len = sys.argv[52]
+train_overwrite_cache = sys.argv[53]
+train_gap_diffusion_loss_weight = sys.argv[54]
+train_gap_grpo_mixed_terminal_filter = sys.argv[55]
+train_gap_grpo_correct_threshold = sys.argv[56]
+train_gap_grpo_min_correct_count = sys.argv[57]
+train_gap_grpo_max_correct_count = sys.argv[58]
 text = config_path.read_text()
 
 
@@ -575,11 +584,13 @@ updated = set_key(updated, "gap_rollout_scope", train_rollout_scope)
 updated = set_key(updated, "gap_reveal_ratio", train_gap_reveal_ratio)
 updated = set_key(updated, "gap_min_reveal_tokens", train_gap_min_reveal_tokens)
 updated = set_key(updated, "gap_remask_threshold", train_gap_remask_threshold)
+updated = set_key(updated, "gap_remask_window_blocks", train_gap_remask_window_blocks)
 updated = set_key(updated, "gap_remask_loss_weight", train_gap_remask_loss_weight)
 updated = set_key(updated, "gap_global_loss_weight", train_gap_global_loss_weight)
 updated = set_key(updated, "gap_diffusion_loss_weight", train_gap_diffusion_loss_weight)
 updated = set_key(updated, "gap_remask_default_p_mask", train_gap_remask_default_p_mask)
 updated = set_key(updated, "gap_grpo_loss_weight", train_gap_grpo_loss_weight)
+updated = set_key(updated, "gap_grpo_action_granularity", train_gap_grpo_action_granularity)
 updated = set_key(updated, "gap_grpo_num_samples", train_gap_grpo_num_samples)
 updated = set_key(
     updated,
@@ -591,6 +602,7 @@ updated = set_key(
     "gap_grpo_min_visible_blocks",
     train_gap_grpo_min_visible_blocks if train_gap_grpo_min_visible_blocks else "null",
 )
+updated = set_key(updated, "gap_grpo_fixed_visible_blocks", train_gap_grpo_fixed_visible_blocks)
 updated = set_key(
     updated,
     "gap_grpo_candidate_window_blocks",
@@ -699,6 +711,7 @@ echo "GAP rollout confidence threshold: ${TRAIN_GAP_ROLLOUT_CONFIDENCE_THRESHOLD
 echo "GAP reveal ratio: ${TRAIN_GAP_REVEAL_RATIO}" >&2
 echo "GAP min reveal tokens: ${TRAIN_GAP_MIN_REVEAL_TOKENS}" >&2
 echo "GAP remask threshold: ${TRAIN_GAP_REMASK_THRESHOLD}" >&2
+echo "GAP remask window blocks: ${TRAIN_GAP_REMASK_WINDOW_BLOCKS}" >&2
 if [[ -n "${SDAR_GAP_REMASK_THRESHOLD_SCHEDULE:-}" ]]; then
     echo "GAP remask threshold schedule: ${SDAR_GAP_REMASK_THRESHOLD_SCHEDULE}" >&2
 fi
@@ -707,9 +720,11 @@ echo "GAP global loss weight: ${TRAIN_GAP_GLOBAL_LOSS_WEIGHT}" >&2
 echo "GAP diffusion loss weight: ${TRAIN_GAP_DIFFUSION_LOSS_WEIGHT}" >&2
 echo "GAP remask default p_mask: ${TRAIN_GAP_REMASK_DEFAULT_P_MASK}" >&2
 echo "GAP GRPO loss weight: ${TRAIN_GAP_GRPO_LOSS_WEIGHT}" >&2
+echo "GAP GRPO action granularity: ${TRAIN_GAP_GRPO_ACTION_GRANULARITY}" >&2
 echo "GAP GRPO num samples: ${TRAIN_GAP_GRPO_NUM_SAMPLES}" >&2
 echo "GAP GRPO num parents: ${TRAIN_GAP_GRPO_NUM_PARENTS}" >&2
 echo "GAP GRPO min visible blocks: ${TRAIN_GAP_GRPO_MIN_VISIBLE_BLOCKS}" >&2
+echo "GAP GRPO fixed visible blocks: ${TRAIN_GAP_GRPO_FIXED_VISIBLE_BLOCKS}" >&2
 echo "GAP GRPO candidate window blocks: ${TRAIN_GAP_GRPO_CANDIDATE_WINDOW_BLOCKS}" >&2
 echo "GAP GRPO diverse rollbacks: ${TRAIN_GAP_GRPO_DIVERSE_ROLLBACKS}" >&2
 echo "GAP GRPO clip eps: ${TRAIN_GAP_GRPO_CLIP_EPS}" >&2

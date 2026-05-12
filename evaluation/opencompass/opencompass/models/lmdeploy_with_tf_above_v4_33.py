@@ -63,7 +63,7 @@ class LMDeploywithChatTemplate(BaseModel):
         dllm_unmasking_strategy = added_model_kwargs.pop("dllm_unmasking_strategy")
         dllm_confidence_threshold = added_model_kwargs.pop("dllm_confidence_threshold", 0.9)
         max_prefill_token_num = added_model_kwargs.pop("max_prefill_token_num", 4096)
-        backend_config = PytorchEngineConfig(
+        backend_config_kwargs = dict(
             tp=tp,
             dtype=dtype,
             max_prefill_token_num=max_prefill_token_num,
@@ -73,6 +73,8 @@ class LMDeploywithChatTemplate(BaseModel):
             dllm_unmasking_strategy=dllm_unmasking_strategy,
             dllm_confidence_threshold=dllm_confidence_threshold,
         )
+        backend_config_kwargs.update(added_model_kwargs)
+        backend_config = PytorchEngineConfig(**backend_config_kwargs)
         self.logger.info('Backend Config of LMDeploy: ')
         self.logger.info(backend_config)
         self.pipe = pipeline(path, backend_config=backend_config)

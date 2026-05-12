@@ -53,5 +53,6 @@ from .zhipuai_api import ZhiPuAI  # noqa: F401
 from .zhipuai_v2_api import ZhiPuV2AI  # noqa: F401
 from .lmdeploy_with_tf_above_v4_33 import LMDeploywithChatTemplate  # noqa: F401
 from .lmdeploy_gap_remask import LMDeployGapRemaskwithChatTemplate  # noqa: F401
+from .lmdeploy_gap_regenerate import LMDeployGapRegeneratewithChatTemplate  # noqa: F401
 from .huggingface_bd3 import BD3withChatTemplate  # noqa: F401
 from .huggingface_sdar_gap import SDARGapwithChatTemplate  # noqa: F401
